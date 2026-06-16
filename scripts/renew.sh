@@ -81,6 +81,55 @@ if output:
         continue
     fi
 
+    # ── ClearPass reachability probe ────────────────────────────────────────
+    # Runs on every renewal check so CPPM outages are detected independently
+    # of whether a cert is due for renewal.
+    CPPM_UNREACHABLE_FLAG="/tmp/cppm_unreachable_${SERVER_ID}"
+    if [[ -n "${CPPM_HOST:-}" ]]; then
+        CPPM_PROBE=$(python3 -c "
+import socket, sys
+try:
+    s = socket.create_connection(('${CPPM_HOST}', 443), timeout=10)
+    s.close()
+    sys.stdout.write('ok\n')
+except Exception as e:
+    sys.stdout.write('error: ' + str(e) + '\n')
+" 2>/dev/null || echo "error: probe failed")
+
+        if [[ "$CPPM_PROBE" == "ok" ]]; then
+            if [[ -f "$CPPM_UNREACHABLE_FLAG" ]]; then
+                log "  ClearPass ${CPPM_HOST} is reachable again."
+                status_write "OK" "CPPM" "ClearPass ${CPPM_HOST} is reachable again"
+                python3 /opt/cppm/notify.py \
+                    --server-id "${SERVER_ID}" \
+                    --event upload_success \
+                    --message "ClearPass ${CPPM_HOST} is reachable again after being offline." \
+                    2>/dev/null || true
+                rm -f "$CPPM_UNREACHABLE_FLAG"
+            fi
+        else
+            log "  WARNING: ClearPass ${CPPM_HOST} is unreachable: ${CPPM_PROBE}"
+            status_write "WARN" "CPPM" "ClearPass ${CPPM_HOST} unreachable: ${CPPM_PROBE}"
+            # Throttle to once per 24 hours so the twice-daily cron doesn't spam
+            SHOULD_NOTIFY=true
+            if [[ -f "$CPPM_UNREACHABLE_FLAG" ]]; then
+                LAST_NOTIFIED=$(cat "$CPPM_UNREACHABLE_FLAG" 2>/dev/null || echo 0)
+                NOW=$(date +%s)
+                if [[ $(( NOW - LAST_NOTIFIED )) -lt 86400 ]]; then
+                    SHOULD_NOTIFY=false
+                fi
+            fi
+            if [[ "$SHOULD_NOTIFY" == "true" ]]; then
+                python3 /opt/cppm/notify.py \
+                    --server-id "${SERVER_ID}" \
+                    --event upload_failed \
+                    --message "ClearPass ${CPPM_HOST} is unreachable on port 443. Certificate upload will fail when renewal is due. Error: ${CPPM_PROBE}" \
+                    2>/dev/null || true
+                date +%s > "$CPPM_UNREACHABLE_FLAG"
+            fi
+        fi
+    fi
+
     ISSUE_ECC="${ISSUE_ECC:-true}"
     ISSUE_RSA="${ISSUE_RSA:-true}"
 
