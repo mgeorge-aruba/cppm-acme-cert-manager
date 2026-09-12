@@ -86,15 +86,24 @@ if [[ "$UPLOAD_HTTPS_RSA" == "true" || "$UPLOAD_RADIUS" == "true" || "$UPLOAD_RA
     for f in "$RADIUS_CERT" "$RADIUS_KEY" "$RADIUS_FULLCHAIN"; do
         [[ -f "$f" ]] || { err "Required file not found: $f"; status_write "FAILED" "UPLOAD" "Cert file missing – ${f}"; exit 1; }
     done
-    [[ "$UPLOAD_HTTPS_RSA" == "true" ]] && UPLOAD_ARGS+=(
-        --https-rsa-cert "$RADIUS_CERT" --https-rsa-key "$RADIUS_KEY" \
-        --https-rsa-fullchain "$RADIUS_FULLCHAIN" --https-rsa-ca "$RADIUS_CA")
-    [[ "$UPLOAD_RADIUS" == "true" ]] && UPLOAD_ARGS+=(
-        --radius-cert "$RADIUS_CERT" --radius-key "$RADIUS_KEY" \
-        --radius-fullchain "$RADIUS_FULLCHAIN" --radius-ca "$RADIUS_CA")
-    [[ "$UPLOAD_RADSEC" == "true" ]] && UPLOAD_ARGS+=(
-        --radsec-cert "$RADIUS_CERT" --radsec-key "$RADIUS_KEY" \
-        --radsec-fullchain "$RADIUS_FULLCHAIN" --radsec-ca "$RADIUS_CA")
+    if [[ "$UPLOAD_HTTPS_RSA" == "true" ]]; then
+        UPLOAD_ARGS+=(--https-rsa-cert "$RADIUS_CERT" --https-rsa-key "$RADIUS_KEY" \
+                      --https-rsa-fullchain "$RADIUS_FULLCHAIN" --https-rsa-ca "$RADIUS_CA")
+    else
+        UPLOAD_ARGS+=(--skip-https-rsa)
+    fi
+    if [[ "$UPLOAD_RADIUS" == "true" ]]; then
+        UPLOAD_ARGS+=(--radius-cert "$RADIUS_CERT" --radius-key "$RADIUS_KEY" \
+                      --radius-fullchain "$RADIUS_FULLCHAIN" --radius-ca "$RADIUS_CA")
+    else
+        UPLOAD_ARGS+=(--skip-radius)
+    fi
+    if [[ "$UPLOAD_RADSEC" == "true" ]]; then
+        UPLOAD_ARGS+=(--radsec-cert "$RADIUS_CERT" --radsec-key "$RADIUS_KEY" \
+                      --radsec-fullchain "$RADIUS_FULLCHAIN" --radsec-ca "$RADIUS_CA")
+    else
+        UPLOAD_ARGS+=(--skip-radsec)
+    fi
     [[ -z "$PRIMARY_CERT" ]] && PRIMARY_CERT="$RADIUS_CERT"
     log "  RADIUS (RSA): ${RADIUS_CERT}"
 else
