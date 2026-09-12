@@ -165,6 +165,7 @@ def migrate_from_env() -> Optional[str]:
         return None
 
     entry = {
+        "certificate_id": re.sub(r"[^\w.\-]", "_", domain).strip("._-") or "certificate",
         "label":                f"ClearPass ({cppm_host})",
         "cppm_host":            cppm_host,
         "cppm_client_id":       os.environ.get("CPPM_CLIENT_ID",       ""),
@@ -204,15 +205,46 @@ def migrate_from_env() -> Optional[str]:
 # ── Per-server directory ──────────────────────────────────────────────────────
 
 def server_cert_dir(server: dict) -> Path:
-    """Return the per-server directory path under the data volume root.
+    """Return the shared certificate directory, or legacy target directory.
 
     Named by the sanitized ClearPass hostname so the layout is human-readable:
-      /data/certs/cppm.example.com/
+    /data/certs/certificates/prod-example/
       /data/certs/cppm-lab.example.com/
     """
+    certificate_id = str(server.get("certificate_id", "")).strip()
+    if certificate_id:
+        safe = re.sub(r"[^\w.\-]", "_", certificate_id).strip("._-") or "certificate"
+        return SERVERS_FILE.parent / "certificates" / safe
+
     host = str(server.get("cppm_host", "")).strip()
     safe = re.sub(r"[^\w.\-]", "_", host).strip("._-") or "default"
     return SERVERS_FILE.parent / safe
+
+
+def certificate_id(server: dict) -> str:
+    """Return the shared certificate profile ID, or the legacy target ID."""
+    configured = str(server.get("certificate_id", "")).strip()
+    if configured:
+        return configured
+    host = str(server.get("cppm_host", "")).strip()
+    return re.sub(r"[^\w.\-]", "_", host).strip("._-") or "default"
+
+
+def certificate_members(profile_id: str) -> list[dict]:
+    """Return all ClearPass targets attached to a certificate profile."""
+    return [s for s in load_servers() if certificate_id(s) == profile_id]
+
+
+def certificate_owner_ids() -> list[str]:
+    """Return one target ID per certificate profile for ACME work."""
+    owners: list[str] = []
+    seen: set[str] = set()
+    for server in load_servers():
+        profile_id = certificate_id(server)
+        if profile_id not in seen and server.get("id"):
+            seen.add(profile_id)
+            owners.append(str(server["id"]))
+    return owners
 
 
 # ── Shell environment export ───────────────────────────────────────────────────
@@ -228,6 +260,7 @@ def get_server_env_dict(server_id: str) -> Optional[dict]:
 
     creds = s.get("dns_credentials") or {}
     env: dict[str, str] = {
+        "CERTIFICATE_ID":       certificate_id(s),
         "DOMAIN":               str(s.get("domain",               "")),
         "ACME_EMAIL":           str(s.get("acme_email",           "")),
         "ACME_SERVER":          str(s.get("acme_server",          "letsencrypt")),

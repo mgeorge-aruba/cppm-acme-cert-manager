@@ -22,11 +22,9 @@ log "=== Renewal Check ==="
 SERVER_IDS=$(python3 -c "
 import sys
 sys.path.insert(0, '/opt/cppm')
-from config_utils import load_servers
-for s in load_servers():
-    sid = s.get('id', '')
-    if sid:
-        print(sid)
+from config_utils import certificate_owner_ids
+for sid in certificate_owner_ids():
+    print(sid)
 " 2>/dev/null || echo "")
 
 if [[ -z "$SERVER_IDS" ]]; then
@@ -34,6 +32,33 @@ if [[ -z "$SERVER_IDS" ]]; then
     log "=== Renewal Check Complete ==="
     exit 0
 fi
+
+upload_profile_targets() {
+    local profile_id="$1"
+    local member_ids
+    member_ids=$(python3 -c "
+import sys
+sys.path.insert(0, '/opt/cppm')
+from config_utils import certificate_members
+for s in certificate_members('${profile_id}'):
+    if s.get('id'):
+        print(s['id'])
+" 2>/dev/null || true)
+    for member_id in $member_ids; do
+        local member_env
+        member_env=$(python3 -c "
+import sys
+sys.path.insert(0, '/opt/cppm')
+from config_utils import get_server_shell_env
+output = get_server_shell_env('${member_id}')
+if output:
+    print(output)
+" 2>/dev/null) || true
+        [[ -z "$member_env" ]] && continue
+        ( eval "$member_env"; /opt/cppm/deploy_hook.sh ) 2>&1 | tee -a "$LOG" || \
+            err "Upload failed for target ${member_id} – check target upload log"
+    done
+}
 
 for SERVER_ID in $SERVER_IDS; do
     log "--- Server: ${SERVER_ID} ---"
@@ -146,13 +171,13 @@ except Exception as e:
         python3 /opt/cppm/acme_cli.py install 2>&1 | tee -a "$LOG" 2>/dev/null || INSTALL_ONLY_EXIT=$?
         if [[ $INSTALL_ONLY_EXIT -eq 0 ]]; then
             log "Install-only succeeded for ${DOMAIN} – triggering upload..."
-            /opt/cppm/deploy_hook.sh 2>&1 | tee -a "$LOG" 2>/dev/null || \
-                err "deploy_hook.sh failed for ${DOMAIN} – check logs"
+            upload_profile_targets "${CERTIFICATE_ID}"
         else
             log "Install-only failed for ${DOMAIN} – falling back to full issuance..."
             status_write "WARN" "RENEW" "Lego state missing for ${DOMAIN} – re-running full issuance"
-            /opt/cppm/issue_cert.sh 2>&1 | tee -a "$LOG" 2>/dev/null || \
+            SKIP_UPLOAD=true /opt/cppm/issue_cert.sh 2>&1 | tee -a "$LOG" 2>/dev/null || \
                 err "issue_cert.sh failed for ${DOMAIN} – check acme_renewal.log"
+            upload_profile_targets "${CERTIFICATE_ID}"
         fi
         continue
     fi
@@ -180,8 +205,9 @@ except Exception:
         0)
             log "Certificate(s) renewed for ${DOMAIN}."
             status_write "OK" "RENEW" "Certificate renewed for ${DOMAIN} – running install and upload"
-            /opt/cppm/install_cert.sh 2>&1 | tee -a "$LOG" 2>/dev/null || \
+            SKIP_UPLOAD=true /opt/cppm/install_cert.sh 2>&1 | tee -a "$LOG" 2>/dev/null || \
                 err "install_cert.sh failed for ${DOMAIN}"
+            upload_profile_targets "${CERTIFICATE_ID}"
             ;;
         2)
             log "Certificate for ${DOMAIN} not due for renewal."

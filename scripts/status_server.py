@@ -45,7 +45,7 @@ from auth_utils import (
 )
 from config_utils import (
     load_servers, get_server, add_server, update_server, delete_server,
-    server_cert_dir, get_server_env_dict,
+  server_cert_dir, get_server_env_dict, certificate_members,
     get_server_notifications, update_server_notifications,
     get_traefik_config, save_traefik_config, get_traefik_log,
 )
@@ -657,7 +657,7 @@ def _check_expiry_warnings() -> None:
 _ISSUE_SCRIPT = Path("/opt/cppm/issue_cert.sh")
 
 def _spawn_cert_pipeline(server_id: str, force: bool = False) -> None:
-    """Run issue_cert.sh for server_id in a background daemon thread."""
+    """Issue one shared profile, then upload it to every associated target."""
     def _run():
         if not _ISSUE_SCRIPT.exists():
             _log.warning("cert pipeline: %s not found (not in container?)", _ISSUE_SCRIPT)
@@ -667,11 +667,31 @@ def _spawn_cert_pipeline(server_id: str, force: bool = False) -> None:
             _log.error("cert pipeline: server %s not found", server_id)
             return
         Path(env_dict["SERVER_LOG_DIR"]).mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, **env_dict, "FORCE_RENEW": "true" if force else "false"}
+        env = {
+            **os.environ, **env_dict,
+            "FORCE_RENEW": "true" if force else "false",
+            "SKIP_UPLOAD": "true",
+        }
         _log.info("cert pipeline: starting for %s (force=%s)", server_id, force)
         try:
             rc = subprocess.run([str(_ISSUE_SCRIPT)], env=env, check=False).returncode
             _log.info("cert pipeline: finished for %s (rc=%d)", server_id, rc)
+            if rc == 0:
+                for member in certificate_members(env_dict["CERTIFICATE_ID"]):
+                    member_env = get_server_env_dict(str(member.get("id", "")))
+                    if not member_env:
+                        continue
+                    Path(member_env["SERVER_LOG_DIR"]).mkdir(parents=True, exist_ok=True)
+                    upload_env = {**os.environ, **member_env}
+                    _log.info(
+                        "cert pipeline: uploading shared profile %s to %s",
+                        env_dict["CERTIFICATE_ID"], member.get("cppm_host", member.get("id")),
+                    )
+                    upload_rc = subprocess.run(
+                        [str(_DEPLOY_SCRIPT)], env=upload_env, check=False
+                    ).returncode
+                    if upload_rc != 0:
+                        _log.error("cert pipeline: upload failed for target %s (rc=%d)", member.get("id"), upload_rc)
         except Exception as exc:
             _log.error("cert pipeline: error for %s: %s", server_id, exc)
 
@@ -751,6 +771,7 @@ def _parse_server_form(f: dict) -> dict:
     acme_server = f.get("acme_server_url", "").strip() if acme_sel == "custom" else acme_sel
     return {
         "label":                f.get("label", "").strip(),
+        "certificate_id":       f.get("certificate_id", "").strip(),
         "cppm_host":            f.get("cppm_host", "").strip(),
         "cppm_client_id":       f.get("cppm_client_id", "").strip(),
         "cppm_client_secret":   f.get("cppm_client_secret", ""),
@@ -773,6 +794,7 @@ def _default_server_from_env() -> dict:
     return {
         "id":                   None,
         "label":                "",
+        "certificate_id":       "",
         "cppm_host":            "",
         "cppm_client_id":       "",
         "cppm_client_secret":   "",
@@ -2247,6 +2269,11 @@ def _settings_form_page(server: dict = None, error: str = "",
         <label>Label <span class="hint">(friendly name)</span></label>
         <input type="text" name="label" value="{fv('label')}" required
                placeholder="e.g. Production ClearPass">
+      </div>
+      <div class="field">
+        <label>Certificate Profile ID <span class="hint">(reuse this value on other ClearPass targets)</span></label>
+        <input type="text" name="certificate_id" value="{fv('certificate_id')}"
+               placeholder="e.g. arubasecurity.com-prod" pattern="[A-Za-z0-9_.-]+">
       </div>
     </div>
 

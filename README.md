@@ -156,7 +156,14 @@ cppm-acme-cert-manager/
 │   ├── startup.log                           ← Container boot log
 │   └── status_server.log                     ← Web UI process log
 │
-├── cppm.example.com/                         ← Per-server directory (one per ClearPass host)
+├── certificates/                             ← Shared ACME certificate profiles
+│   └── prod-arubasecurity/                   ← One ACME/Lego state per profile
+│       ├── <domain>.ecc.cer / .ecc.key / ...
+│       ├── <domain>.rsa.cer / .rsa.key / ...
+│       ├── lego-ecc/ and lego-rsa/
+│       └── .logs/acme_renewal.log
+│
+├── cppm.example.com/                         ← Legacy per-server directory
 │   ├── status.log                            ← Activity log (web UI Activity tab, public)
 │   ├── <domain>.ecc.cer / .ecc.key / ...     ← ECC cert files (flat layout, identical to acme.sh output)
 │   ├── <domain>.rsa.cer / .rsa.key / ...     ← RSA cert files
@@ -166,9 +173,21 @@ cppm-acme-cert-manager/
 │       ├── acme_renewal.log                  ← Lego issuance/renewal detail (auth required)
 │       └── cppm_upload.log                   ← ClearPass API upload detail (auth required)
 │
-└── cppm-lab.example.com/                     ← Second server (same structure)
+└── cppm-lab.example.com/                     ← Legacy second server
     └── ...
 ```
+
+### Shared Certificates Across ClearPass Targets
+
+Each ClearPass entry has a **Certificate Profile ID** in the web UI. Give
+multiple ClearPass entries the same profile ID to share one ACME certificate.
+The profile's domain, ACME account, DNS provider, and DNS credentials must also
+match. The manager issues or renews ECC/RSA once per profile, then uploads the
+resulting certificate sequentially to every associated ClearPass target.
+
+Use **Force Certificate Issue** to renew the shared profile and upload it to all
+associated targets. Use **Force Upload** when only one target needs its existing
+certificate installed; this does not contact the ACME provider.
 
 ---
 

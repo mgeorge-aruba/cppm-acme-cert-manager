@@ -1216,53 +1216,9 @@ def main() -> int:
     else:
         log.info("== Step 0: SKIPPED ==========================================")
 
-    # Step 1 — ECC cert → HTTPS(ECC) slot
-    if not args.skip_https_ecc:
-        log.info("== Step 1: HTTPS(ECC) Server Certificate =======================")
-        try:
-            result = upload_https_certificate(
-                api, _token, host,
-                args.https_ecc_cert, args.https_ecc_key, args.https_fullchain,
-                passphrase, callback_host, callback_port, "ecc"
-            )
-            log.info("HTTPS upload response: %s", json.dumps(result, indent=2)
-                     if isinstance(result, dict) else result)
-            try:
-                expiry = _run_openssl(
-                    ["x509", "-noout", "-enddate", "-in", args.https_ecc_cert]
-                ).strip().split("=", 1)[-1]
-            except Exception:
-                expiry = ""
-            status_write("OK", "UPLOAD",
-                         f"HTTPS(ECC) cert uploaded to {host}"
-                         + (f" – expires {expiry}" if expiry else ""))
-        except Exception as exc:
-            log.error("HTTPS upload FAILED: %s", exc)
-            hard_errors.append(f"HTTPS: {exc}")
-    else:
-        log.info("== Step 1: SKIPPED ==========================================")
-
-    # Step 2 — RSA cert → HTTPS(RSA) slot
-    if not args.skip_https_rsa:
-        log.info("== Step 2: HTTPS(RSA) Server Certificate =====================")
-        try:
-            result = upload_https_certificate(
-                api, _token, host,
-                args.https_rsa_cert, args.https_rsa_key, args.https_rsa_fullchain,
-                passphrase, callback_host, callback_port, "rsa"
-            )
-            log.info("HTTPS(RSA) upload response: %s", json.dumps(result, indent=2)
-                     if isinstance(result, dict) else result)
-            status_write("OK", "UPLOAD", f"HTTPS(RSA) cert uploaded to {host}")
-        except Exception as exc:
-            log.error("HTTPS(RSA) upload FAILED: %s", exc)
-            hard_errors.append(f"HTTPS(RSA): {exc}")
-    else:
-        log.info("== Step 2: SKIPPED ==========================================")
-
-    # Step 3 — RSA cert → RADIUS slot
+    # Step 1 — RSA cert → RADIUS slot
     if not args.skip_radius:
-        log.info("== Step 3: RADIUS (RSA) Service Certificate =================")
+        log.info("== Step 1: RADIUS (RSA) Service Certificate =================")
         try:
             result = upload_radius_certificate(
                 api, _token, host,
@@ -1279,11 +1235,11 @@ def main() -> int:
             log.error("RADIUS upload FAILED: %s", exc)
             hard_errors.append(f"RADIUS: {exc}")
     else:
-        log.info("== Step 3: SKIPPED ==========================================")
+        log.info("== Step 1: SKIPPED ==========================================")
 
-    # Step 4 — RSA cert → RadSec slot
+    # Step 2 — RSA cert → RadSec slot
     if not args.skip_radsec:
-        log.info("== Step 4: RadSec (RSA) Service Certificate ==================")
+        log.info("== Step 2: RadSec (RSA) Service Certificate ==================")
         try:
             result = upload_radsec_certificate(
                 api, _token, host,
@@ -1300,10 +1256,55 @@ def main() -> int:
             log.error("RadSec upload FAILED: %s", exc)
             hard_errors.append(f"RadSec: {exc}")
     else:
+        log.info("== Step 2: SKIPPED ==========================================")
+
+    # Step 3 — ECC cert → HTTPS(ECC) slot. Keep HTTPS last because ClearPass
+    # may restart its web services when an HTTPS certificate is replaced.
+    if not args.skip_https_ecc:
+        log.info("== Step 3: HTTPS(ECC) Server Certificate =======================")
+        try:
+            result = upload_https_certificate(
+                api, _token, host,
+                args.https_ecc_cert, args.https_ecc_key, args.https_fullchain,
+                passphrase, callback_host, callback_port, "ecc"
+            )
+            log.info("HTTPS(ECC) upload response: %s", json.dumps(result, indent=2)
+                     if isinstance(result, dict) else result)
+            try:
+                expiry = _run_openssl(
+                    ["x509", "-noout", "-enddate", "-in", args.https_ecc_cert]
+                ).strip().split("=", 1)[-1]
+            except Exception:
+                expiry = ""
+            status_write("OK", "UPLOAD",
+                         f"HTTPS(ECC) cert uploaded to {host}"
+                         + (f" – expires {expiry}" if expiry else ""))
+        except Exception as exc:
+            log.error("HTTPS(ECC) upload FAILED: %s", exc)
+            hard_errors.append(f"HTTPS(ECC): {exc}")
+    else:
+        log.info("== Step 3: SKIPPED ==========================================")
+
+    # Step 4 — RSA cert → HTTPS(RSA) slot. This remains the final update.
+    if not args.skip_https_rsa:
+        log.info("== Step 4: HTTPS(RSA) Server Certificate =====================")
+        try:
+            result = upload_https_certificate(
+                api, _token, host,
+                args.https_rsa_cert, args.https_rsa_key, args.https_rsa_fullchain,
+                passphrase, callback_host, callback_port, "rsa"
+            )
+            log.info("HTTPS(RSA) upload response: %s", json.dumps(result, indent=2)
+                     if isinstance(result, dict) else result)
+            status_write("OK", "UPLOAD", f"HTTPS(RSA) cert uploaded to {host}")
+        except Exception as exc:
+            log.error("HTTPS(RSA) upload FAILED: %s", exc)
+            hard_errors.append(f"HTTPS(RSA): {exc}")
+    else:
         log.info("== Step 4: SKIPPED ==========================================")
 
-    # Step 4 — Verification
-    log.info("== Step 4: Verification =========================================")
+    # Step 5 — Verification
+    log.info("== Step 5: Verification =========================================")
     try:
         if verify_cert_installed(api, args.domain):
             log.info("[OK] Domain '%s' found in installed cert.", args.domain)
