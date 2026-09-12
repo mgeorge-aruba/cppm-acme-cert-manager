@@ -185,6 +185,9 @@ The profile's domain, ACME account, DNS provider, and DNS credentials must also
 match. The manager issues or renews ECC/RSA once per profile, then uploads the
 resulting certificate sequentially to every associated ClearPass target.
 
+The ACME Provider section also accepts up to 10 optional **SAN DNS** names.
+They are included in every ECC/RSA certificate alongside the primary domain.
+
 Use **Force Certificate Issue** to renew the shared profile and upload it to all
 associated targets. Use **Force Upload** when only one target needs its existing
 certificate installed; this does not contact the ACME provider.

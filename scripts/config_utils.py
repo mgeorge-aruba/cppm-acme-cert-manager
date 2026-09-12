@@ -68,6 +68,20 @@ def certificate_targets(entry: dict) -> list[str]:
         targets.update(("radius", "radsec"))
     return [t for t in ("https_ecc", "https_rsa", "radius", "radsec") if t in targets]
 
+
+def san_dns_names(entry: dict) -> list[str]:
+    """Return up to ten normalized optional SAN DNS names."""
+    primary = str(entry.get("domain", "")).strip().lower()
+    values = entry.get("san_dns") or []
+    if isinstance(values, str):
+        values = values.replace(",", "\n").splitlines()
+    result: list[str] = []
+    for value in values:
+        name = str(value).strip().lower()
+        if name and name != primary and name not in result:
+            result.append(name)
+    return result[:10]
+
 def validate_server(entry: dict) -> None:
     """Raises ValueError on missing or invalid fields."""
     for field in _REQUIRED:
@@ -262,6 +276,7 @@ def get_server_env_dict(server_id: str) -> Optional[dict]:
     env: dict[str, str] = {
         "CERTIFICATE_ID":       certificate_id(s),
         "DOMAIN":               str(s.get("domain",               "")),
+        "SAN_DNS":              "|".join(san_dns_names(s)),
         "ACME_EMAIL":           str(s.get("acme_email",           "")),
         "ACME_SERVER":          str(s.get("acme_server",          "letsencrypt")),
         "DNS_PROVIDER":         str(s.get("dns_provider",         "")),

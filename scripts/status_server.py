@@ -780,6 +780,7 @@ def _parse_server_form(f: dict) -> dict:
         "cppm_callback_host":   f.get("cppm_callback_host", "").strip(),
         "cppm_callback_port":   f.get("cppm_callback_port", "8765").strip() or "8765",
         "domain":               f.get("domain", "").strip(),
+        "san_dns":              [name for name in san_dns if name],
         "acme_email":           f.get("acme_email", "").strip(),
         "acme_server":          acme_server or "letsencrypt",
         "dns_provider":         provider,
@@ -803,6 +804,7 @@ def _default_server_from_env() -> dict:
         "cppm_callback_host":   "",
         "cppm_callback_port":   "8765",
         "domain":               "",
+        "san_dns":              [],
         "acme_email":           "",
         "acme_server":          "letsencrypt",
         "dns_provider":         "cloudflare",
@@ -2252,6 +2254,13 @@ def _settings_form_page(server: dict = None, error: str = "",
     chk_https_rsa = " checked" if "https_rsa" in cert_types else ""
     chk_radius = " checked" if "radius" in cert_types or "rsa" in cert_types else ""
     chk_radsec = " checked" if "radsec" in cert_types or "rsa" in cert_types else ""
+    san_dns = s.get("san_dns") or []
+    san_fields = "".join(
+      f'''<div class="field"><label>SAN DNS {i}</label>
+      <input type="text" name="san_dns_{i}" value="{_esc(str(san_dns[i - 1])) if len(san_dns) >= i else ""}"
+           placeholder="alt{i}.{fv('domain')}"></div>'''
+      for i in range(1, 11)
+    )
     # Form body — f-string with all interpolated Python values.
     # JavaScript is in a separate raw string appended below (no {{ }} issues).
     form = f"""
@@ -2339,6 +2348,9 @@ def _settings_form_page(server: dict = None, error: str = "",
                  placeholder="admin@example.com">
         </div>
       </div>
+      <div class="form-section-title" style="margin-top:1rem">Subject Alternative Names (optional)</div>
+      <p class="hint" style="margin:0 0 0.75rem">Add up to 10 additional DNS names to this certificate.</p>
+      <div class="form-2col">{san_fields}</div>
       <div class="field">
         <label>Certificate Authority</label>
         <select name="acme_server" id="acme_server" onchange="switchAcme(this.value)">

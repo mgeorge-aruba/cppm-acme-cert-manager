@@ -83,6 +83,10 @@ def _dns_env() -> dict[str, str]:
     return {k: os.environ[k] for k in _DNS_CRED_KEYS if k in os.environ}
 
 
+def _san_domains() -> list[str]:
+    return [name.strip() for name in os.environ.get("SAN_DNS", "").split("|") if name.strip()]
+
+
 def _log_file(cert_dir: str) -> str:
     log_dir = os.environ.get("SERVER_LOG_DIR", os.path.join(cert_dir, ".logs"))
     return os.path.join(log_dir, "acme_renewal.log")
@@ -124,6 +128,7 @@ def cmd_issue(args: argparse.Namespace) -> None:
     try:
         result = provider.issue_cert(
             domain=domain,
+            san_domains=_san_domains(),
             acme_server=acme_server,
             cert_dir=cert_dir,
             key_types=key_types,
@@ -157,6 +162,7 @@ def cmd_renew(_args: argparse.Namespace) -> None:
     try:
         result = provider.renew_cert(
             domain=domain,
+            san_domains=_san_domains(),
             acme_server=acme_server,
             cert_dir=cert_dir,
             key_types=key_types,

@@ -124,6 +124,7 @@ class LegoProvider(AcmeProvider):
         self,
         *,
         domain: str,
+        san_domains: list[str] | None = None,
         acme_server: str,
         cert_dir: str,
         key_types: list[str],
@@ -139,6 +140,7 @@ class LegoProvider(AcmeProvider):
         eab_args = self._eab_args(
             dns_env.get("EAB_KID", ""), dns_env.get("EAB_HMAC_KEY", "")
         )
+        san_domains = san_domains or []
         results: list[KeyTypeResult] = []
 
         log.info(
@@ -170,6 +172,7 @@ class LegoProvider(AcmeProvider):
                 "--accept-tos",
                 "--email",    email,
                 "--domains",  domain,
+                *sum((["--domains", san] for san in san_domains), []),
                 "--dns",      plugin,
                 "--path",     lego_path,
                 "--server",   server_url,
@@ -193,6 +196,7 @@ class LegoProvider(AcmeProvider):
         self,
         *,
         domain: str,
+        san_domains: list[str] | None = None,
         acme_server: str,
         cert_dir: str,
         key_types: list[str],
@@ -207,6 +211,7 @@ class LegoProvider(AcmeProvider):
         eab_args = self._eab_args(
             dns_env.get("EAB_KID", ""), dns_env.get("EAB_HMAC_KEY", "")
         )
+        san_domains = san_domains or []
         results: list[KeyTypeResult] = []
         failures: list[str] = []
 
