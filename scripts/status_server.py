@@ -769,6 +769,7 @@ def _parse_server_form(f: dict) -> dict:
         cred_keys = [*cred_keys, "EAB_KID", "EAB_HMAC_KEY"]
     acme_sel  = f.get("acme_server", "letsencrypt")
     acme_server = f.get("acme_server_url", "").strip() if acme_sel == "custom" else acme_sel
+    san_dns = [f.get(f"san_dns_{i}", "").strip().lower() for i in range(1, 11)]
     return {
         "label":                f.get("label", "").strip(),
         "certificate_id":       f.get("certificate_id", "").strip(),
