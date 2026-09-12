@@ -745,6 +745,8 @@ def _parse_server_form(f: dict) -> dict:
     """Convert POST form data into a server config dict."""
     provider  = f.get("dns_provider", "cloudflare")
     cred_keys = _DNS_CRED_FIELDS.get(provider, [])
+    if f.get("acme_server", "letsencrypt") == "zerossl":
+        cred_keys = [*cred_keys, "EAB_KID", "EAB_HMAC_KEY"]
     acme_sel  = f.get("acme_server", "letsencrypt")
     acme_server = f.get("acme_server_url", "").strip() if acme_sel == "custom" else acme_sel
     return {
@@ -761,8 +763,8 @@ def _parse_server_form(f: dict) -> dict:
         "acme_server":          acme_server or "letsencrypt",
         "dns_provider":         provider,
         "dns_credentials":      {k: f.get(k, "") for k in cred_keys},
-        "cert_types": [t for t in ("ecc", "rsa")
-                       if f.get(f"issue_{t}") == "true"] or ["ecc", "rsa"],
+        "cert_types": [t for t in ("https_ecc", "https_rsa", "radius", "radsec")
+                 if f.get(f"issue_{t}") == "true"] or ["https_ecc", "https_rsa", "radius", "radsec"],
     }
 
 
@@ -783,7 +785,7 @@ def _default_server_from_env() -> dict:
         "acme_server":          "letsencrypt",
         "dns_provider":         "cloudflare",
         "dns_credentials":      {},
-        "cert_types":           ["ecc", "rsa"],
+        "cert_types":           ["https_ecc", "https_rsa", "radius", "radsec"],
     }
 
 
@@ -2223,9 +2225,11 @@ def _settings_form_page(server: dict = None, error: str = "",
     acme_srv   = "custom" if acme_is_custom else acme_srv_raw
     acme_custom_url = _esc(acme_srv_raw) if acme_is_custom else ""
     verify     = " checked" if s.get("cppm_verify_ssl") else ""
-    cert_types = s.get("cert_types") or ["ecc", "rsa"]
-    chk_ecc    = " checked" if "ecc" in cert_types else ""
-    chk_rsa    = " checked" if "rsa" in cert_types else ""
+    cert_types = s.get("cert_types") or ["https_ecc", "https_rsa", "radius", "radsec"]
+    chk_https_ecc = " checked" if "https_ecc" in cert_types or "ecc" in cert_types else ""
+    chk_https_rsa = " checked" if "https_rsa" in cert_types else ""
+    chk_radius = " checked" if "radius" in cert_types or "rsa" in cert_types else ""
+    chk_radsec = " checked" if "radsec" in cert_types or "rsa" in cert_types else ""
     # Form body — f-string with all interpolated Python values.
     # JavaScript is in a separate raw string appended below (no {{ }} issues).
     form = f"""
@@ -2319,6 +2323,21 @@ def _settings_form_page(server: dict = None, error: str = "",
           <option value="custom"{sel(acme_srv,'custom')}>Custom / Private CA</option>
         </select>
       </div>
+      <div id="acme-eab-section" style="{'display:none' if acme_srv != 'zerossl' else ''}">
+        <div class="flash flash-warn" style="margin-bottom:0.75rem">
+          ZeroSSL requires External Account Binding credentials. Get the KID and HMAC key from your ZeroSSL account.
+        </div>
+        <div class="form-2col">
+          <div class="field">
+            <label>EAB KID</label>
+            <input type="text" name="EAB_KID" value="{cv('EAB_KID')}" autocomplete="off">
+          </div>
+          <div class="field">
+            <label>EAB HMAC Key</label>
+            <input type="password" name="EAB_HMAC_KEY" value="{cv('EAB_HMAC_KEY')}" autocomplete="new-password">
+          </div>
+        </div>
+      </div>
       <div id="acme-custom-section" style="{'display:none' if acme_srv != 'custom' else ''}">
         <div class="flash flash-warn" style="margin-bottom:0.75rem">
           <strong>Private ACME server required.</strong>
@@ -2337,14 +2356,24 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="field" style="margin-bottom:0">
         <label>Certificate Types</label>
         <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
-          <input type="checkbox" name="issue_ecc" value="true"{chk_ecc}
+             <input type="checkbox" name="issue_https_ecc" value="true"{chk_https_ecc}
                  style="width:auto;margin:0">
-          ECC <span class="hint">— HTTPS / Web Interface</span>
+             HTTPS (ECC) <span class="hint">— Web UI and API</span>
         </label>
         <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
-          <input type="checkbox" name="issue_rsa" value="true"{chk_rsa}
+             <input type="checkbox" name="issue_https_rsa" value="true"{chk_https_rsa}
                  style="width:auto;margin:0">
-          RSA <span class="hint">— RADIUS / 802.1x</span>
+             HTTPS (RSA) <span class="hint">— Web UI and API</span>
+           </label>
+           <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
+             <input type="checkbox" name="issue_radius" value="true"{chk_radius}
+               style="width:auto;margin:0">
+             RADIUS <span class="hint">— 802.1X / EAP</span>
+           </label>
+           <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
+             <input type="checkbox" name="issue_radsec" value="true"{chk_radsec}
+               style="width:auto;margin:0">
+             RadSec <span class="hint">— RADIUS over TLS</span>
         </label>
       </div>
     </div>
@@ -2547,9 +2576,11 @@ function switchDns(val) {
 function switchAcme(val) {
   var sec = document.getElementById('acme-custom-section');
   var urlInput = document.getElementById('acme_server_url');
+  var eabSec = document.getElementById('acme-eab-section');
   var isCustom = val === 'custom';
   sec.style.display = isCustom ? '' : 'none';
   urlInput.required = isCustom;
+  eabSec.style.display = val === 'zerossl' ? '' : 'none';
 }
 (function() {
   switchDns(document.getElementById('dns_provider').value);

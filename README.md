@@ -10,10 +10,12 @@ on the host.
 
 Two certificates are issued and maintained simultaneously:
 
-| Certificate | Algorithm | CPPM Service | Purpose |
+| Certificate target | Algorithm | CPPM Service | Purpose |
 |---|---|---|---|
-| ECC (P-256) | ECDSA | HTTPS(ECC) | Web UI and API access |
-| RSA (2048) | RSA | RADIUS | 802.1X / EAP authentication |
+| HTTPS (ECC) | ECDSA | HTTPS(ECC) | Web UI and API access |
+| HTTPS (RSA) | RSA | HTTPS(RSA) | Web UI and API access |
+| RADIUS | RSA | RADIUS | 802.1X / EAP authentication |
+| RadSec | RSA | RadSec | RADIUS over TLS authentication |
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -24,22 +26,24 @@ Two certificates are issued and maintained simultaneously:
 │  │  (supercronic│          │  (Cloudflare,   │                           │
 │  │   2x daily)  │          │   Porkbun, etc) │                           │
 │  └──────┬───────┘          └─────────────────┘                           │
-│         │ ECC + RSA certs issued/renewed                                 │
+│         │ One ECC and/or RSA cert issued/renewed                          │
 │         ▼                                                                │
 │  ┌──────────────┐  PKCS12 + REST API  ┌──────────────────────────────┐   │
 │  │ deploy_hook  │────────────────────►│  clearpass_upload.py         │   │
 │  │    .sh       │                     │  (pyclearpass SDK)           │   │
 │  └──────────────┘                     │                              │   │
 │                                       │  Step 0: ACME CA Trust List  │   │
-│                                       │  Step 1: PUT HTTPS(ECC) cert │   │
-│                                       │  Step 2: PUT RADIUS(RSA) cert│   │
-│                                       │  Step 3: Verify              │   │
+│                                       │  Step 1: PUT selected HTTPS  │   │
+│                                       │  Step 2: PUT selected RADIUS │   │
+│                                       │  Step 3: PUT selected RadSec │   │
+│                                       │  Step 4: Verify              │   │
 │                                       └──────────────┬───────────────┘   │
 │                                                      │                   │
 │                                              ┌───────▼──────┐            │
 │                                              │     CPPM     │            │
-│                                              │  HTTPS(ECC)  │            │
-│                                              │  RADIUS(RSA) │            │
+│                                              │  HTTPS RSA/ECC│           │
+│                                              │  RADIUS       │            │
+│                                              │  RadSec       │            │
 │                                              └──────────────┘            │
 │                                                                          │
 │  Persistent storage: /opt/cppm-certs (host) ◄──── /data/certs (container)│
@@ -190,6 +194,11 @@ chmod +x setup.sh && ./setup.sh
 `setup.sh` verifies Docker, creates `/opt/cppm-certs`, and copies
 `docker-compose.override.yml.example` to `docker-compose.override.yml` if it
 does not already exist.
+
+The Compose service uses Cloudflare and Google public DNS resolvers for reliable
+DNS-01 zone discovery. If your network blocks those resolvers, override the
+service DNS settings in `docker-compose.override.yml` with resolvers reachable
+from your Docker host.
 
 ### 3. Configure local overrides (optional)
 

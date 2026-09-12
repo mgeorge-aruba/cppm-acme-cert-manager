@@ -59,6 +59,15 @@ def get_server(server_id: str) -> Optional[dict]:
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
+def certificate_targets(entry: dict) -> list[str]:
+    """Return normalized ClearPass targets, including legacy config values."""
+    targets = set(entry.get("cert_types") or [])
+    if "ecc" in targets:
+        targets.add("https_ecc")
+    if "rsa" in targets:
+        targets.update(("radius", "radsec"))
+    return [t for t in ("https_ecc", "https_rsa", "radius", "radsec") if t in targets]
+
 def validate_server(entry: dict) -> None:
     """Raises ValueError on missing or invalid fields."""
     for field in _REQUIRED:
@@ -71,9 +80,10 @@ def validate_server(entry: dict) -> None:
             raise ValueError()
     except (ValueError, TypeError):
         raise ValueError("Callback port must be a number between 1 and 65535.")
-    cert_types = entry.get("cert_types") or []
-    if not any(t in cert_types for t in ("ecc", "rsa")):
-        raise ValueError("At least one certificate type (ECC or RSA) must be selected.")
+    cert_types = certificate_targets(entry)
+    valid_types = {"https_ecc", "https_rsa", "radius", "radsec"}
+    if not any(t in cert_types for t in valid_types):
+        raise ValueError("At least one ClearPass certificate target must be selected.")
 
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
@@ -167,7 +177,7 @@ def migrate_from_env() -> Optional[str]:
         "acme_email":           os.environ.get("ACME_EMAIL",           ""),
         "acme_server":          os.environ.get("ACME_SERVER",          "letsencrypt"),
         "dns_provider":         os.environ.get("DNS_PROVIDER",         "cloudflare"),
-        "cert_types": ["ecc", "rsa"],
+        "cert_types": ["https_ecc", "https_rsa", "radius", "radsec"],
         "dns_credentials": {k: v for k, v in {
             "CF_Token":               os.environ.get("CF_Token",               ""),
             "CF_Account_ID":          os.environ.get("CF_Account_ID",          ""),
@@ -229,8 +239,12 @@ def get_server_env_dict(server_id: str) -> Optional[dict]:
         "CPPM_CERT_PASSPHRASE": str(s.get("cppm_cert_passphrase", "")),
         "CPPM_CALLBACK_HOST":   str(s.get("cppm_callback_host",   "")),
         "CPPM_CALLBACK_PORT":   str(s.get("cppm_callback_port",   "8765")),
-        "ISSUE_ECC":            "true" if "ecc" in (s.get("cert_types") or ["ecc", "rsa"]) else "false",
-        "ISSUE_RSA":            "true" if "rsa" in (s.get("cert_types") or ["ecc", "rsa"]) else "false",
+        "ISSUE_ECC":            "true" if "https_ecc" in certificate_targets(s) else "false",
+        "ISSUE_RSA":            "true" if any(t in certificate_targets(s) for t in ("https_rsa", "radius", "radsec")) else "false",
+        "UPLOAD_HTTPS_ECC":     "true" if "https_ecc" in certificate_targets(s) else "false",
+        "UPLOAD_HTTPS_RSA":     "true" if "https_rsa" in certificate_targets(s) else "false",
+        "UPLOAD_RADIUS":        "true" if "radius" in certificate_targets(s) else "false",
+        "UPLOAD_RADSEC":        "true" if "radsec" in certificate_targets(s) else "false",
         "SERVER_CERT_DIR":      str(server_cert_dir(s)),
         "SERVER_LOG_DIR":       str(server_cert_dir(s) / ".logs"),
         "STATUS_LOG":           str(server_cert_dir(s) / "status.log"),

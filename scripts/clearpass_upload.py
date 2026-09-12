@@ -11,9 +11,11 @@ source of endpoint paths and body schemas.
 
 Steps:
   0  Trust list pre-flight  – ensure all ACME CA certs are trusted (EAP + Others)
-  1  HTTPS server cert      – upload ECC PKCS12 to the HTTPS service slot (skipped with --skip-https)
-  2  RADIUS service cert    – upload RSA PKCS12 to the RADIUS service slot (skipped with --skip-radius)
-  3  Verify                 – confirm domain appears in installed cert list
+    1  HTTPS(ECC) server cert – upload ECC PKCS12 to the HTTPS(ECC) slot
+    2  HTTPS(RSA) server cert – upload RSA PKCS12 to the HTTPS(RSA) slot
+    3  RADIUS service cert    – upload RSA PKCS12 to the RADIUS slot
+    4  RadSec service cert    – upload RSA PKCS12 to the RadSec slot
+    5  Verify                 – confirm domain appears in installed cert list
 
 SDK notes
 ─────────
@@ -750,6 +752,7 @@ def upload_https_certificate(
     passphrase: str,
     callback_host: str,
     callback_port: int,
+    certificate_kind: str = "ecc",
 ) -> dict:
     """
     Upload the HTTPS server certificate.
@@ -766,16 +769,20 @@ def upload_https_certificate(
     server_uuid = _get_server_uuid(api)
     items       = _get_server_cert_items(api)
 
-    # Prefer HTTPS(ECC) over HTTPS(RSA), then any HTTPS variant
+    preferred_services = ("HTTPS(ECC)", "HTTPS(RSA)")
+    if certificate_kind == "rsa":
+        preferred_services = ("HTTPS(RSA)", "HTTPS(ECC)")
+
+    # Prefer the slot matching the selected certificate kind, then any HTTPS variant.
     service_name: Optional[str] = None
-    for preferred in ("HTTPS(ECC)", "HTTPS(RSA)"):
+    for preferred in preferred_services:
         for item in items:
             if str(item.get("service_name", "")).upper() == preferred.upper():
                 service_name = str(item.get("service_name", ""))
                 break
         if service_name:
             break
-    if not service_name:
+    if not service_name and certificate_kind not in ("ecc", "rsa"):
         for item in items:
             if str(item.get("service_name", "")).upper().startswith("HTTPS"):
                 service_name = str(item.get("service_name", ""))
@@ -833,13 +840,9 @@ def upload_radius_certificate(
     server_uuid = _get_server_uuid(api)
     items       = _get_server_cert_items(api)
 
-    service_name: Optional[str] = None
-    for item in items:
-        svc = str(item.get("service_name", ""))
-        if "RADIUS" in svc.upper() or "EAP" in svc.upper():
-            service_name = svc
-            log.info("  Found RADIUS entry: service_name=%s", service_name)
-            break
+    service_name = _find_service_name(items, "radius")
+    if service_name:
+        log.info("  Found RADIUS entry: service_name=%s", service_name)
 
     if not service_name:
         log.warning(
@@ -865,6 +868,64 @@ def upload_radius_certificate(
             callback_host, callback_port,
         )
         log.info("  RADIUS certificate uploaded successfully.")
+        return {}
+    finally:
+        Path(pfx_path).unlink(missing_ok=True)
+
+
+def _find_service_name(items: list[dict], service_type: str) -> Optional[str]:
+    """Find a ClearPass server-cert service by its API service name."""
+    for item in items:
+        service_name = str(item.get("service_name", ""))
+        upper_name = service_name.upper()
+        if service_type == "radius":
+            # Keep a dedicated RADSEC slot out of the RADIUS selection.
+            matched = ("RADIUS" in upper_name and "RADSEC" not in upper_name) or "EAP" in upper_name
+        else:
+            matched = "RADSEC" in re.sub(r"[^A-Z0-9]", "", upper_name)
+        if matched:
+            return service_name
+    return None
+
+
+def upload_radsec_certificate(
+    api: ApiPlatformCertificates,
+    token: str,
+    host: str,
+    cert_path: str,
+    key_path: str,
+    fullchain_path: str,
+    passphrase: str,
+    callback_host: str,
+    callback_port: int,
+) -> dict:
+    """Upload the RSA certificate to a dedicated RadSec service slot if present."""
+    log.info("Uploading RadSec service certificate...")
+
+    server_uuid = _get_server_uuid(api)
+    items = _get_server_cert_items(api)
+    service_name = _find_service_name(items, "radsec")
+    if not service_name:
+        log.info("  No dedicated RadSec entry found in server-cert list; skipping.")
+        return {"status": "skipped", "reason": "radsec_service_not_present"}
+
+    log.info("  Found RadSec entry: service_name=%s", service_name)
+    log.info("  server_uuid=%s  callback_url=http://%s:%d",
+             server_uuid, callback_host, callback_port)
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".pfx", prefix="cppm_radsec_", dir="/tmp", delete=False
+    ) as tmp:
+        pfx_path = tmp.name
+
+    try:
+        pem_to_pkcs12(cert_path, key_path, fullchain_path, passphrase, pfx_path)
+        _serve_pkcs12_and_upload(
+            token, host, api.verify_ssl,
+            server_uuid, service_name, pfx_path, passphrase,
+            callback_host, callback_port,
+        )
+        log.info("  RadSec certificate uploaded successfully.")
         return {}
     finally:
         Path(pfx_path).unlink(missing_ok=True)
@@ -913,16 +974,24 @@ Methods used:
 Note: PATCH /api/server-cert/{id} is NOT used — CPPM returns 405 for PATCH.
 """,
     )
-    # ECC cert → HTTPS(ECC) slot (required unless --only-trust-check)
-    p.add_argument("--https-cert",      default=None, help="ECC domain cert (.ecc.cer)")
-    p.add_argument("--https-key",       default=None, help="ECC private key (.ecc.key)")
-    p.add_argument("--https-fullchain", default=None, help="ECC fullchain (.ecc.fullchain.cer)")
-    p.add_argument("--https-ca",        default=None, help="ECC CA chain (.ecc.ca.cer)")
+    # ECC/RSA certs → HTTPS(ECC)/HTTPS(RSA) slots
+    p.add_argument("--https-ecc-cert",      default=None, help="ECC domain cert (.ecc.cer)")
+    p.add_argument("--https-ecc-key",       default=None, help="ECC private key (.ecc.key)")
+    p.add_argument("--https-fullchain",     default=None, help="HTTPS fullchain")
+    p.add_argument("--https-ca",            default=None, help="HTTPS CA chain")
+    p.add_argument("--https-rsa-cert",      default=None, help="RSA domain cert (.rsa.cer)")
+    p.add_argument("--https-rsa-key",       default=None, help="RSA private key (.rsa.key)")
+    p.add_argument("--https-rsa-fullchain", default=None, help="RSA fullchain (.rsa.fullchain.cer)")
+    p.add_argument("--https-rsa-ca",        default=None, help="RSA CA chain (.rsa.ca.cer)")
     # RSA cert → RADIUS slot (required unless --only-trust-check)
     p.add_argument("--radius-cert",      default=None, help="RSA domain cert (.rsa.cer)")
     p.add_argument("--radius-key",       default=None, help="RSA private key (.rsa.key)")
     p.add_argument("--radius-fullchain", default=None, help="RSA fullchain (.rsa.fullchain.cer)")
     p.add_argument("--radius-ca",        default=None, help="RSA CA chain (.rsa.ca.cer)")
+    p.add_argument("--radsec-cert",      default=None, help="RSA domain cert for RadSec")
+    p.add_argument("--radsec-key",       default=None, help="RSA private key for RadSec")
+    p.add_argument("--radsec-fullchain", default=None, help="RSA fullchain for RadSec")
+    p.add_argument("--radsec-ca",        default=None, help="RSA CA chain for RadSec")
 
     p.add_argument("--domain",           default=os.environ.get("DOMAIN", ""))
     p.add_argument("--skip-trust-check", action="store_true",
@@ -930,7 +999,9 @@ Note: PATCH /api/server-cert/{id} is NOT used — CPPM returns 405 for PATCH.
     p.add_argument("--only-trust-check", action="store_true",
                    help="Run Step 0 only (trust list verify/upload) — skip cert upload steps")
     p.add_argument("--skip-radius",      action="store_true")
-    p.add_argument("--skip-https",       action="store_true")
+    p.add_argument("--skip-https-ecc",   action="store_true")
+    p.add_argument("--skip-https-rsa",   action="store_true")
+    p.add_argument("--skip-radsec",      action="store_true")
     return p.parse_args()
 
 
@@ -964,20 +1035,34 @@ def main() -> int:
         return 1
 
     # Cert files are required for full upload mode; optional for trust-check-only
-    https_files = [
-        ("https-cert",      args.https_cert),
-        ("https-key",       args.https_key),
+    https_ecc_files = [
+        ("https-ecc-cert",  args.https_ecc_cert),
+        ("https-ecc-key",   args.https_ecc_key),
         ("https-fullchain", args.https_fullchain),
+    ]
+    https_rsa_files = [
+        ("https-rsa-cert",      args.https_rsa_cert),
+        ("https-rsa-key",       args.https_rsa_key),
+        ("https-rsa-fullchain", args.https_rsa_fullchain),
     ]
     radius_files = [
         ("radius-cert",     args.radius_cert),
         ("radius-key",      args.radius_key),
         ("radius-fullchain",args.radius_fullchain),
     ]
-    required_files = ([] if args.skip_https else https_files) + \
-                     ([] if args.skip_radius else radius_files)
+    radsec_files = [
+        ("radsec-cert",      args.radsec_cert),
+        ("radsec-key",       args.radsec_key),
+        ("radsec-fullchain", args.radsec_fullchain),
+    ]
+    required_files = (
+        ([] if args.skip_https_ecc else https_ecc_files)
+        + ([] if args.skip_https_rsa else https_rsa_files)
+        + ([] if args.skip_radius else radius_files)
+        + ([] if args.skip_radsec else radsec_files)
+    )
     if args.only_trust_check:
-        for label, path in https_files + radius_files:
+        for label, path in https_ecc_files + https_rsa_files + radius_files + radsec_files:
             if path and not Path(path).is_file():
                 log.error("File not found (%s): %s", label, path)
                 return 1
@@ -993,15 +1078,23 @@ def main() -> int:
     # CA chains for trust list pre-flight.
     # Both ECC and RSA chains are passed so intermediates unique to either chain
     # (e.g. R13 in the RSA chain when ECC uses E6) are all discovered and uploaded.
-    https_ca  = args.https_ca  or (
-        str(Path(args.https_cert).parent / f"{args.domain}.ecc.ca.cer")
-        if args.https_cert else ""
+    https_ecc_ca = args.https_ca or (
+        str(Path(args.https_ecc_cert).parent / f"{args.domain}.ecc.ca.cer")
+        if args.https_ecc_cert else ""
+    )
+    https_rsa_ca = args.https_rsa_ca or (
+        str(Path(args.https_rsa_cert).parent / f"{args.domain}.rsa.ca.cer")
+        if args.https_rsa_cert else ""
     )
     radius_ca = args.radius_ca or (
         str(Path(args.radius_cert).parent / f"{args.domain}.rsa.ca.cer")
         if args.radius_cert else ""
     )
-    ca_paths = [p for p in [https_ca, radius_ca] if p]
+    radsec_ca = args.radsec_ca or (
+        str(Path(args.radsec_cert).parent / f"{args.domain}.rsa.ca.cer")
+        if args.radsec_cert else ""
+    )
+    ca_paths = [p for p in [https_ecc_ca, https_rsa_ca, radius_ca, radsec_ca] if p]
 
     # ── Session header — written to cppm_upload.log for easy troubleshooting ──
     log.info("=" * 62)
@@ -1011,10 +1104,14 @@ def main() -> int:
     log.info("  Callback : http://%s:%d/", callback_host, callback_port)
     log.info("  DNS      : %s", os.environ.get("DNS_PROVIDER", "unknown"))
     log.info("  ACME CA  : %s", _ca_label(os.environ.get("ACME_SERVER", "letsencrypt")))
-    if not args.skip_https:
-        log.info("  HTTPS cert: %s", args.https_cert or "(not provided)")
+    if not args.skip_https_ecc:
+        log.info("  HTTPS(ECC) cert: %s", args.https_ecc_cert or "(not provided)")
+    if not args.skip_https_rsa:
+        log.info("  HTTPS(RSA) cert: %s", args.https_rsa_cert or "(not provided)")
     if not args.skip_radius:
         log.info("  RADIUS cert: %s", args.radius_cert or "(not provided)")
+    if not args.skip_radsec:
+        log.info("  RadSec cert: %s", args.radsec_cert or "(not provided)")
     log.info("=" * 62)
 
     if not verify_ssl:
@@ -1120,19 +1217,19 @@ def main() -> int:
         log.info("== Step 0: SKIPPED ==========================================")
 
     # Step 1 — ECC cert → HTTPS(ECC) slot
-    if not args.skip_https:
+    if not args.skip_https_ecc:
         log.info("== Step 1: HTTPS(ECC) Server Certificate =======================")
         try:
             result = upload_https_certificate(
                 api, _token, host,
-                args.https_cert, args.https_key, args.https_fullchain,
-                passphrase, callback_host, callback_port
+                args.https_ecc_cert, args.https_ecc_key, args.https_fullchain,
+                passphrase, callback_host, callback_port, "ecc"
             )
             log.info("HTTPS upload response: %s", json.dumps(result, indent=2)
                      if isinstance(result, dict) else result)
             try:
                 expiry = _run_openssl(
-                    ["x509", "-noout", "-enddate", "-in", args.https_cert]
+                    ["x509", "-noout", "-enddate", "-in", args.https_ecc_cert]
                 ).strip().split("=", 1)[-1]
             except Exception:
                 expiry = ""
@@ -1145,9 +1242,27 @@ def main() -> int:
     else:
         log.info("== Step 1: SKIPPED ==========================================")
 
-    # Step 2 — RSA cert → RADIUS slot
+    # Step 2 — RSA cert → HTTPS(RSA) slot
+    if not args.skip_https_rsa:
+        log.info("== Step 2: HTTPS(RSA) Server Certificate =====================")
+        try:
+            result = upload_https_certificate(
+                api, _token, host,
+                args.https_rsa_cert, args.https_rsa_key, args.https_rsa_fullchain,
+                passphrase, callback_host, callback_port, "rsa"
+            )
+            log.info("HTTPS(RSA) upload response: %s", json.dumps(result, indent=2)
+                     if isinstance(result, dict) else result)
+            status_write("OK", "UPLOAD", f"HTTPS(RSA) cert uploaded to {host}")
+        except Exception as exc:
+            log.error("HTTPS(RSA) upload FAILED: %s", exc)
+            hard_errors.append(f"HTTPS(RSA): {exc}")
+    else:
+        log.info("== Step 2: SKIPPED ==========================================")
+
+    # Step 3 — RSA cert → RADIUS slot
     if not args.skip_radius:
-        log.info("== Step 2: RADIUS (RSA) Service Certificate =================")
+        log.info("== Step 3: RADIUS (RSA) Service Certificate =================")
         try:
             result = upload_radius_certificate(
                 api, _token, host,
@@ -1157,19 +1272,38 @@ def main() -> int:
             log.info("RADIUS upload response: %s", json.dumps(result, indent=2)
                      if isinstance(result, dict) else result)
             if isinstance(result, dict) and result.get("status") == "skipped":
-                status_write("INFO", "UPLOAD",
-                             f"RADIUS step skipped – CPPM uses a unified HTTPS/RADIUS cert; "
-                             f"HTTPS upload already covers RADIUS on {host}")
+                status_write("INFO", "UPLOAD", f"RADIUS step skipped – no dedicated RADIUS service slot found on {host}")
             else:
                 status_write("OK", "UPLOAD", f"RADIUS(RSA) cert uploaded to {host}")
         except Exception as exc:
             log.error("RADIUS upload FAILED: %s", exc)
             hard_errors.append(f"RADIUS: {exc}")
     else:
-        log.info("== Step 2: SKIPPED ==========================================")
+        log.info("== Step 3: SKIPPED ==========================================")
 
-    # Step 3 — Verification
-    log.info("== Step 3: Verification =========================================")
+    # Step 4 — RSA cert → RadSec slot
+    if not args.skip_radsec:
+        log.info("== Step 4: RadSec (RSA) Service Certificate ==================")
+        try:
+            result = upload_radsec_certificate(
+                api, _token, host,
+                args.radsec_cert, args.radsec_key, args.radsec_fullchain,
+                passphrase, callback_host, callback_port
+            )
+            log.info("RadSec upload response: %s", json.dumps(result, indent=2)
+                     if isinstance(result, dict) else result)
+            if isinstance(result, dict) and result.get("status") == "skipped":
+                status_write("INFO", "UPLOAD", f"RadSec step skipped – no dedicated RadSec service slot found on {host}")
+            else:
+                status_write("OK", "UPLOAD", f"RadSec(RSA) cert uploaded to {host}")
+        except Exception as exc:
+            log.error("RadSec upload FAILED: %s", exc)
+            hard_errors.append(f"RadSec: {exc}")
+    else:
+        log.info("== Step 4: SKIPPED ==========================================")
+
+    # Step 4 — Verification
+    log.info("== Step 4: Verification =========================================")
     try:
         if verify_cert_installed(api, args.domain):
             log.info("[OK] Domain '%s' found in installed cert.", args.domain)

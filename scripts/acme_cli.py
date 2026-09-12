@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 # the provider's dns_env so it can pick what it needs and remap as required.
 _DNS_CRED_KEYS = {
     "ACME_EMAIL",
+    "EAB_KID", "EAB_HMAC_KEY",
     # Cloudflare
     "CF_Token", "CF_Key", "CF_Email", "CF_Zone_ID", "CF_Account_ID",
     # Porkbun
