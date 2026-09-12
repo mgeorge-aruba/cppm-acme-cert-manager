@@ -290,10 +290,11 @@ def _check_response(data: Any, operation: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def ensure_letsencrypt_chain_trusted(
-    api: ApiPlatformCertificates, ca_cert_paths: list[str]
+    api: ApiPlatformCertificates, ca_cert_paths: list[str],
+    radsec_required: bool = False,
 ) -> dict:
     """
-    Ensure every LE CA cert is in the CPPM trust list with EAP + Others enabled.
+    Ensure every ACME CA cert is trusted for the selected ClearPass services.
 
     Uses pyclearpass.ApiPlatformCertificates:
       get_cert_trust_list()                               – list entries
@@ -307,6 +308,10 @@ def ensure_letsencrypt_chain_trusted(
     """
     log.info("=" * 62)
     log.info("Step 0: ACME CA Trust List Pre-flight")
+    required_usages = ["EAP", "Others"]
+    if radsec_required:
+        required_usages.append("RadSec")
+    log.info("  Required trust usages: %s", ", ".join(required_usages))
     log.info("  SDK: ApiPlatformCertificates.get/new/update_cert_trust_list")
     log.info("=" * 62)
 
@@ -426,20 +431,25 @@ def ensure_letsencrypt_chain_trusted(
                 usage_strs = [str(u) for u in usage_raw]
                 eap_ok    = "EAP"    in usage_strs
                 others_ok = "Others" in usage_strs
+                radsec_ok = not radsec_required or "RadSec" in usage_strs
             else:
                 usage_int = int(usage_raw) if usage_raw else 0
                 eap_ok    = bool(usage_int & 2)
                 others_ok = bool(usage_int & 16)
+                # The SDK exposes usage as an array, so numeric legacy values
+                # cannot safely identify the RadSec bit. Patch them when RadSec
+                # is selected and let ClearPass normalize the representation.
+                radsec_ok = not radsec_required
             enabled = bool(existing.get("enabled", False))
 
-            if enabled and eap_ok and others_ok:
-                log.info("  [OK] Already trusted (id=%s, EAP=true, Others=true)", entry_id)
+            if enabled and eap_ok and others_ok and radsec_ok:
+                log.info("  [OK] Already trusted (id=%s, usages=%s)", entry_id, required_usages)
                 summary["already_trusted"].append(cert.label)
             else:
                 log.info(
                     "  [PATCH] Present (id=%s) flags incomplete "
-                    "(enabled=%s EAP=%s Others=%s) – patching...",
-                    entry_id, enabled, eap_ok, others_ok,
+                    "(enabled=%s EAP=%s Others=%s RadSec=%s) – patching...",
+                    entry_id, enabled, eap_ok, others_ok, radsec_ok,
                 )
                 try:
                     if entry_id is not None:
@@ -453,7 +463,7 @@ def ensure_letsencrypt_chain_trusted(
                                     cert_trust_list_id=str(entry_id),
                                     body={
                                         "enabled":    True,
-                                        "cert_usage": ["EAP", "Others"],
+                                        "cert_usage": required_usages,
                                     },
                                 )
                                 _check_response(resp, f"patch trust entry {entry_id}")
@@ -484,7 +494,7 @@ def ensure_letsencrypt_chain_trusted(
                 resp = api.new_cert_trust_list(body={
                     "cert_file":  cert.pem.strip() + "\n",
                     "enabled":    True,
-                    "cert_usage": ["EAP", "Others"],
+                    "cert_usage": required_usages,
                 })
                 # Detect any duplicate-rejection response from CPPM.
                 # Covers HTTP 409 Conflict as well as 422 Unprocessable, and a range
@@ -1187,7 +1197,9 @@ def main() -> int:
     if args.only_trust_check:
         log.info("== Mode: Trust List Verification Only =======================")
         try:
-            summary = ensure_letsencrypt_chain_trusted(api, ca_paths)
+            summary = ensure_letsencrypt_chain_trusted(
+                api, ca_paths, radsec_required=not args.skip_radsec
+            )
             if summary["failed"]:
                 status_write("WARN", "TRUST",
                              f"Trust check incomplete – failed: {summary['failed']}")
@@ -1205,7 +1217,9 @@ def main() -> int:
     if not args.skip_trust_check:
         log.info("== Step 0: Trust List Pre-flight ============================")
         try:
-            summary = ensure_letsencrypt_chain_trusted(api, ca_paths)
+            summary = ensure_letsencrypt_chain_trusted(
+                api, ca_paths, radsec_required=not args.skip_radsec
+            )
             if summary["failed"]:
                 soft_errors.append(
                     f"Trust list incomplete – missing: {summary['failed']}"
