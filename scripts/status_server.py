@@ -307,7 +307,6 @@ def _fetch_cluster_node_status(server: dict) -> list[dict]:
     """Return per-node server certificate service status for cluster mode."""
     try:
         import requests
-        from pyclearpass import ClearPassAPILogin, ApiPlatformCertificates
         from pyclearpass.api_localserverconfiguration import ApiLocalServerConfiguration
 
         host = server.get("cppm_host", "")
@@ -334,12 +333,24 @@ def _fetch_cluster_node_status(server: dict) -> list[dict]:
           if not node_host:
             result.append({"host": node_name, "services": [], "error": "Node address does not resolve"})
             continue
-            node_api = ApiPlatformCertificates(
-                server=f"https://{node_host}/api", api_token=token,
-                verify_ssl=verify, timeout=8,
+            node_response = requests.get(
+              f"https://{node_host}/api/server-cert",
+              headers={"Authorization": f"Bearer {token}", "Host": node_name},
+              verify=verify, timeout=8, allow_redirects=False,
             )
+            # ClearPass may redirect an IP request to its configured FQDN. Keep
+            # the request pinned to management_ip because that FQDN may not
+            # resolve from the Docker host.
+            if 300 <= node_response.status_code < 400:
+              node_response = requests.get(
+                f"https://{node_host}/api/server-cert",
+                    headers={"Authorization": f"Bearer {token}", "Host": node_name},
+                verify=verify, timeout=8, allow_redirects=False,
+              )
+            node_response.raise_for_status()
+            node_data = node_response.json()
             services = []
-            for item in _api_items(node_api.get_server_cert()):
+            for item in _api_items(node_data):
                 name = str(item.get("service_name", ""))
                 if name in ("HTTPS(ECC)", "HTTPS(RSA)", "RADIUS", "RadSec"):
                     services.append({
