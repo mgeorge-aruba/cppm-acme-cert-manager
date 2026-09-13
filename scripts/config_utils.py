@@ -116,8 +116,33 @@ def _check_duplicate_host(host: str, exclude_id: str = None) -> None:
             )
 
 
+def _inherit_certificate_profile(entry: dict, exclude_id: str = None) -> dict:
+    """Fill shared ACME fields from an existing explicit certificate profile."""
+    profile_id = str(entry.get("certificate_id", "")).strip()
+    if not profile_id:
+        return entry
+    for existing in load_servers():
+        if existing.get("id") == exclude_id:
+            continue
+        if str(existing.get("certificate_id", "")).strip() != profile_id:
+            continue
+        merged = dict(entry)
+        for field in (
+            "domain", "san_dns", "acme_email", "acme_server",
+            "dns_provider", "dns_credentials", "cert_types",
+        ):
+            if field in existing:
+                value = existing[field]
+                merged[field] = dict(value) if field == "dns_credentials" else (
+                    list(value) if isinstance(value, list) else value
+                )
+        return merged
+    return entry
+
+
 def add_server(entry: dict) -> str:
     """Validate, check for duplicate host, and append. Returns the assigned server ID."""
+    entry = _inherit_certificate_profile(dict(entry))
     validate_server(entry)
     _check_duplicate_host(entry.get("cppm_host", ""))
     entry = dict(entry)
@@ -130,6 +155,7 @@ def add_server(entry: dict) -> str:
 
 def update_server(server_id: str, entry: dict) -> bool:
     """Replace the existing entry with the given ID. Returns True if found."""
+    entry = _inherit_certificate_profile(dict(entry), exclude_id=server_id)
     validate_server(entry)
     _check_duplicate_host(entry.get("cppm_host", ""), exclude_id=server_id)
     servers = load_servers()
@@ -281,6 +307,7 @@ def get_server_env_dict(server_id: str) -> Optional[dict]:
         "ACME_SERVER":          str(s.get("acme_server",          "letsencrypt")),
         "DNS_PROVIDER":         str(s.get("dns_provider",         "")),
         "CPPM_HOST":            str(s.get("cppm_host",            "")),
+        "CPPM_CLUSTER_MODE":    "true" if s.get("cppm_cluster_mode") else "false",
         "CPPM_CLIENT_ID":       str(s.get("cppm_client_id",       "")),
         "CPPM_CLIENT_SECRET":   str(s.get("cppm_client_secret",   "")),
         "CPPM_VERIFY_SSL":      "true" if s.get("cppm_verify_ssl") else "false",

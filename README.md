@@ -181,12 +181,19 @@ cppm-acme-cert-manager/
 
 Each ClearPass entry has a **Certificate Profile ID** in the web UI. Give
 multiple ClearPass entries the same profile ID to share one ACME certificate.
-The profile's domain, ACME account, DNS provider, and DNS credentials must also
-match. The manager issues or renews ECC/RSA once per profile, then uploads the
-resulting certificate sequentially to every associated ClearPass target.
+When adding a target with an existing Profile ID, leave the domain, SANs, ACME,
+DNS, and certificate-target fields empty or at their defaults; they are inherited
+from the existing profile. The manager issues or renews ECC/RSA once per profile,
+then uploads the resulting certificate sequentially to every associated target.
 
 The ACME Provider section also accepts up to 10 optional **SAN DNS** names.
 They are included in every ECC/RSA certificate alongside the primary domain.
+
+Enable **Cluster mode** on a ClearPass target to upload the selected certificates
+to every node returned by `GET /api/cluster/server`. The configured API client,
+secret, and callback host are reused for each node. Cluster uploads run
+sequentially, and HTTPS targets remain last because ClearPass may restart web
+services after an HTTPS certificate update.
 
 Use **Force Certificate Issue** to renew the shared profile and upload it to all
 associated targets. Use **Force Upload** when only one target needs its existing

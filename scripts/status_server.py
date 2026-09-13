@@ -239,7 +239,7 @@ def build_server_status(server: dict) -> dict:
     tz       = _tz()
     domain   = server.get("domain", "")
     cert_dir = server_cert_dir(server)
-    return {
+    status = {
         "id":              server.get("id", ""),
         "label":           server.get("label", domain),
         "cppm_host":       server.get("cppm_host", ""),
@@ -252,10 +252,82 @@ def build_server_status(server: dict) -> dict:
             "ecc": parse_cert(cert_dir / f"{domain}.ecc.cer"),
             "rsa": parse_cert(cert_dir / f"{domain}.rsa.cer"),
         },
+        "targets": server.get("cert_types") or ["https_ecc", "https_rsa", "radius", "radsec"],
+        "cluster_mode": bool(server.get("cppm_cluster_mode", False)),
+        "cluster_nodes": [],
         "schedule":    next_check_info(),
         "activity":    parse_log(server, 40),
         "server_time": datetime.datetime.now(tz).isoformat(),
     }
+    if status["cluster_mode"]:
+        status["cluster_nodes"] = _fetch_cluster_node_status(server)
+    return status
+
+
+def _api_items(data) -> list[dict]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        embedded = data.get("_embedded")
+        if isinstance(embedded, dict) and isinstance(embedded.get("items"), list):
+            return [item for item in embedded["items"] if isinstance(item, dict)]
+        if isinstance(data.get("items"), list):
+            return [item for item in data["items"] if isinstance(item, dict)]
+    return []
+
+
+def _fetch_cluster_node_status(server: dict) -> list[dict]:
+    """Return per-node server certificate service status for cluster mode."""
+    try:
+        import requests
+        from pyclearpass import ClearPassAPILogin, ApiPlatformCertificates
+        from pyclearpass.api_localserverconfiguration import ApiLocalServerConfiguration
+
+        host = server.get("cppm_host", "")
+        verify = bool(server.get("cppm_verify_ssl", False))
+        response = requests.post(
+            f"https://{host}/api/oauth",
+            data={"grant_type": "client_credentials",
+                  "client_id": server.get("cppm_client_id", ""),
+                  "client_secret": server.get("cppm_client_secret", "")},
+            timeout=8, verify=verify,
+        )
+        response.raise_for_status()
+        token = response.json().get("access_token", "")
+        login = ClearPassAPILogin(
+            server=f"https://{host}/api", api_token=token,
+            verify_ssl=verify, timeout=8,
+        )
+        nodes_raw = ApiLocalServerConfiguration(
+            server=login.server, api_token=token, verify_ssl=verify, timeout=8
+        ).get_cluster_server()
+        result = []
+        for node in _api_items(nodes_raw):
+            node_host = next(
+                (str(node.get(k, "")).strip() for k in
+                 ("ip_address", "server_ip", "ip", "hostname", "fqdn", "host")
+                 if node.get(k)), ""
+            )
+            if not node_host:
+                continue
+            node_api = ApiPlatformCertificates(
+                server=f"https://{node_host}/api", api_token=token,
+                verify_ssl=verify, timeout=8,
+            )
+            services = []
+            for item in _api_items(node_api.get_server_cert()):
+                name = str(item.get("service_name", ""))
+                if name in ("HTTPS(ECC)", "HTTPS(RSA)", "RADIUS", "RadSec"):
+                    services.append({
+                        "service_name": name,
+                        "service_id": item.get("service_id"),
+                        "status": "installed" if item.get("enabled", True) else "disabled",
+                    })
+            result.append({"host": node_host, "services": services})
+        return result
+    except Exception as exc:
+        _log.warning("cluster status unavailable for %s: %s", server.get("cppm_host", "?"), exc)
+        return [{"host": server.get("cppm_host", ""), "services": [], "error": str(exc)}]
 
 
 def build_all_status() -> list:
@@ -774,6 +846,7 @@ def _parse_server_form(f: dict) -> dict:
         "label":                f.get("label", "").strip(),
         "certificate_id":       f.get("certificate_id", "").strip(),
         "cppm_host":            f.get("cppm_host", "").strip(),
+        "cppm_cluster_mode":   f.get("cppm_cluster_mode", "") == "true",
         "cppm_client_id":       f.get("cppm_client_id", "").strip(),
         "cppm_client_secret":   f.get("cppm_client_secret", ""),
         "cppm_verify_ssl":      f.get("cppm_verify_ssl", "") == "true",
@@ -798,6 +871,7 @@ def _default_server_from_env() -> dict:
         "label":                "",
         "certificate_id":       "",
         "cppm_host":            "",
+        "cppm_cluster_mode":   False,
         "cppm_client_id":       "",
         "cppm_client_secret":   "",
         "cppm_verify_ssl":      False,
@@ -2295,6 +2369,13 @@ def _settings_form_page(server: dict = None, error: str = "",
           <input type="text" name="cppm_host" value="{fv('cppm_host')}" required
                  placeholder="cppm.example.com">
         </div>
+        <div class="field" style="display:flex;align-items:end;padding-bottom:0.5rem">
+          <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+            <input type="checkbox" name="cppm_cluster_mode" value="true"{(' checked' if s.get('cppm_cluster_mode') else '')}
+                   style="width:auto;margin:0">
+            Cluster mode <span class="hint">— upload to all ClearPass nodes</span>
+          </label>
+        </div>
         <div class="field">
           <label>Client ID</label>
           <input type="text" name="cppm_client_id" value="{fv('cppm_client_id')}" required
@@ -2340,12 +2421,12 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="form-2col">
         <div class="field">
           <label>Domain</label>
-          <input type="text" name="domain" value="{fv('domain')}" required
+             <input type="text" name="domain" value="{fv('domain')}"
                  placeholder="cppm.example.com">
         </div>
         <div class="field">
           <label>ACME Email</label>
-          <input type="email" name="acme_email" value="{fv('acme_email')}" required
+             <input type="email" name="acme_email" value="{fv('acme_email')}"
                  placeholder="admin@example.com">
         </div>
       </div>
@@ -3219,6 +3300,7 @@ _DETAIL_BODY = """
 </div>
 
 <div class="grid-2" id="cert-cards"></div>
+<div id="cluster-cards"></div>
 <div class="grid-2" id="info-cards"></div>
 
 <div class="log-card">
@@ -3278,7 +3360,7 @@ _DETAIL_SCRIPT = """
 // SERVER_ID is injected as a <script> block immediately before this file
 var REFRESH_MS = 30000;
 var HEALTH_MS  = 300000;
-var _certData  = {ecc: null, rsa: null};
+var _certData  = {ecc: null, rsa: null, https_ecc: null, https_rsa: null, radius: null, radsec: null};
 var _statusData = null;
 var _healthData = {};
 var _SERVER_ID  = (typeof SERVER_ID !== 'undefined') ? SERVER_ID : 'env';
@@ -3340,6 +3422,18 @@ function renderInfoCards(data, health){
   return sched+cfg;
 }
 
+function renderClusterNodes(data){
+  if(!data.cluster_mode)return'';
+  var nodes=data.cluster_nodes||[];
+  if(!nodes.length)return'<div class="card"><div class="card-title">Cluster Nodes</div><div class="empty">No cluster nodes discovered.</div></div>';
+  return'<div class="card" style="margin-bottom:1rem"><div class="card-title">ClearPass Cluster Nodes</div>'
+    +nodes.map(function(node){
+      var services=(node.services||[]).map(function(s){return'<span class="badge badge-ok" style="margin:0 .3rem .3rem 0">'+esc(s.service_name)+' · '+esc(s.status)+'</span>';}).join('');
+      return'<div class="row" style="display:block;padding:.65rem 0;border-bottom:1px solid var(--border)"><strong>'+esc(node.host||'Unknown node')+'</strong>'
+        +(node.error?'<div class="hint">'+esc(node.error)+'</div>':(services||'<div class="hint">No certificate service data</div>'))+'</div>';
+    }).join('')+'</div>';
+}
+
 function renderLog(activity){
   if(!activity||!activity.length)return'<tr><td colspan="4"><div class="empty">No activity recorded yet.</div></td></tr>';
   return activity.map(function(e){return'<tr><td class="ts">'+esc(e.ts)+'</td><td class="lvl-cell">'+lvlBadge(e.level)+'</td><td class="cat">'+esc(e.category)+'</td><td class="msg">'+esc(e.message)+'</td></tr>';}).join('');
@@ -3352,7 +3446,12 @@ function render(data){
   var ecc=(data.certs&&data.certs.ecc)||{exists:false};
   var rsa=(data.certs&&data.certs.rsa)||{exists:false};
   _certData.ecc=ecc; _certData.rsa=rsa;
-  document.getElementById('cert-cards').innerHTML=renderCertCard(ecc,'ECC Certificate','HTTPS(ECC)','ecc')+renderCertCard(rsa,'RSA Certificate','RADIUS','rsa');
+  _certData.https_ecc=ecc; _certData.https_rsa=rsa; _certData.radius=rsa; _certData.radsec=rsa;
+  document.getElementById('cert-cards').innerHTML=renderCertCard(ecc,'HTTPS (ECC)','HTTPS(ECC)','https_ecc')
+    +renderCertCard(rsa,'HTTPS (RSA)','HTTPS(RSA)','https_rsa')
+    +renderCertCard(rsa,'RADIUS','RADIUS','radius')
+    +renderCertCard(rsa,'RadSec','RadSec','radsec');
+  document.getElementById('cluster-cards').innerHTML=renderClusterNodes(data);
   document.getElementById('info-cards').innerHTML=renderInfoCards(data,_healthData);
   document.getElementById('log-body').innerHTML=renderLog(data.activity);
   if(_activeLogTab==='activity'){
@@ -3362,7 +3461,7 @@ function render(data){
 }
 
 function showCert(key){
-  var labels={ecc:'ECC Certificate',rsa:'RSA Certificate'};
+  var labels={ecc:'ECC Certificate',rsa:'RSA Certificate',https_ecc:'HTTPS (ECC)',https_rsa:'HTTPS (RSA)',radius:'RADIUS',radsec:'RadSec'};
   showModal(_certData[key]||{exists:false},labels[key]||key);
 }
 

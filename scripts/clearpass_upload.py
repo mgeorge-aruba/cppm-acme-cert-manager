@@ -43,6 +43,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1018,6 +1019,49 @@ Note: PATCH /api/server-cert/{id} is NOT used — CPPM returns 405 for PATCH.
     return p.parse_args()
 
 
+def _cluster_hosts(api: ApiPlatformCertificates, current_host: str) -> list[str]:
+    """Return reachable cluster node addresses from ClearPass cluster metadata."""
+    from pyclearpass.api_localserverconfiguration import ApiLocalServerConfiguration
+
+    local_api = ApiLocalServerConfiguration(
+        server=api.server, api_token=api.api_token,
+        verify_ssl=api.verify_ssl, timeout=api.timeout,
+    )
+    raw = local_api.get_cluster_server()
+    _check_response(raw, "get_cluster_server")
+
+    items = _items_from_response(raw)
+    hosts: list[str] = []
+    keys = ("ip_address", "server_ip", "ip", "hostname", "fqdn", "host")
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        value = next((str(item.get(key, "")).strip() for key in keys if item.get(key)), "")
+        if value and value not in hosts:
+            hosts.append(value)
+    if not hosts:
+        raise RuntimeError(f"GET /api/cluster/server returned no node addresses: {raw}")
+    if current_host not in hosts:
+        hosts.insert(0, current_host)
+    return hosts
+
+
+def _run_cluster_uploads(args: argparse.Namespace, hosts: list[str]) -> int:
+    """Run the normal upload workflow once per cluster node."""
+    failures = 0
+    child_env = {**os.environ, "CPPM_CLUSTER_MODE": "false"}
+    for host in hosts:
+        log.info("Cluster mode: uploading to node %s", host)
+        node_env = {**child_env, "CPPM_HOST": host}
+        result = subprocess.run(
+            [sys.executable, __file__, *sys.argv[1:]], env=node_env, check=False
+        )
+        if result.returncode != 0:
+            failures += 1
+            log.error("Cluster node upload failed for %s (exit %d)", host, result.returncode)
+    return 1 if failures else 0
+
+
 def main() -> int:
     args = parse_args()
 
@@ -1192,6 +1236,15 @@ def main() -> int:
         timeout=60,
     )
     api = ApiPlatformCertificates(**sdk_args)
+
+    if os.environ.get("CPPM_CLUSTER_MODE", "false").lower() == "true":
+        try:
+            hosts = _cluster_hosts(api, host)
+            log.info("Cluster mode enabled: discovered %d node(s): %s", len(hosts), hosts)
+            return _run_cluster_uploads(args, hosts)
+        except Exception as exc:
+            log.error("Cluster discovery failed: %s", exc)
+            return 1
 
     # ── Trust-check-only mode ────────────────────────────────────────────────
     # --only-trust-check: run Step 0 only, then exit.  Used by trust_check.sh
