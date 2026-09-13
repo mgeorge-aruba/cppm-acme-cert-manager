@@ -320,12 +320,9 @@ def _fetch_cluster_node_status(server: dict) -> list[dict]:
         )
         response.raise_for_status()
         token = response.json().get("access_token", "")
-        login = ClearPassAPILogin(
-            server=f"https://{host}/api", api_token=token,
-            verify_ssl=verify, timeout=8,
-        )
         nodes_raw = ApiLocalServerConfiguration(
-            server=login.server, api_token=token, verify_ssl=verify, timeout=8
+          server=f"https://{host}/api", api_token=token,
+          verify_ssl=verify, timeout=8,
         ).get_cluster_server()
         result = []
         for node in _api_items(nodes_raw):
