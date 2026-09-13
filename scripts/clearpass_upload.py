@@ -1047,7 +1047,7 @@ def _cluster_hosts(api: ApiPlatformCertificates, current_host: str) -> list[str]
         if not isinstance(item, dict):
             continue
         value = ""
-        for key in ("ip_address", "server_ip", "ip"):
+        for key in ("management_ip", "ip_address", "server_ip", "ip"):
             candidate = str(item.get(key, "")).strip()
             if candidate:
                 try:
@@ -1057,7 +1057,7 @@ def _cluster_hosts(api: ApiPlatformCertificates, current_host: str) -> list[str]
                 except ValueError:
                     pass
         if not value:
-            for key in ("hostname", "fqdn", "host", "server_name"):
+            for key in ("fqdn", "server_dns_name", "hostname", "host", "server_name"):
                 candidate = str(item.get(key, "")).strip()
                 if candidate:
                     try:

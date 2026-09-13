@@ -282,9 +282,9 @@ def _node_address(node: dict) -> tuple[str, str]:
     import socket
 
     display = next((str(node.get(k, "")).strip() for k in
-                    ("server_name", "hostname", "fqdn", "host", "ip_address")
+            ("fqdn", "server_dns_name", "name", "hostname", "host", "ip_address")
                     if node.get(k)), "Unknown node")
-    for key in ("ip_address", "server_ip", "ip"):
+    for key in ("management_ip", "ip_address", "server_ip", "ip"):
         value = str(node.get(key, "")).strip()
         if value:
             try:
