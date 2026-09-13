@@ -1424,10 +1424,16 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .mini-label{font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:0.1rem}
 .mini-exp{font-size:0.68rem;color:var(--subtle);margin-top:0.12rem}
 .mini-svc{font-size:0.62rem;color:var(--muted);background:rgba(148,163,184,.08);border-radius:3px;padding:0.05rem 0.35rem;margin-top:0.25rem;display:inline-block;border:1px solid rgba(148,163,184,.15)}
+.cert-badges{display:flex;flex-wrap:wrap;gap:0.4rem}
+.cert-badges .mini-cert{min-width:76px}
 .sched-next{font-size:1.05rem;font-weight:700;color:var(--accent);line-height:1}
 .sched-label{font-size:0.68rem;color:var(--muted);margin-top:0.15rem}
 .sched-sub{font-size:0.65rem;color:var(--subtle);margin-top:0.1rem}
-@media(max-width:900px){.overview-table th:nth-child(5),.overview-table td:nth-child(5){display:none}}
+.cluster-row td{padding:0 0.85rem 0.85rem;border-bottom:1px solid rgba(51,65,85,.4)}
+.cluster-nodes-inline{display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center}
+.cluster-lbl{font-size:0.62rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--subtle);flex-shrink:0}
+.cluster-node-chip{display:flex;align-items:center;flex-wrap:wrap;gap:0.35rem;background:rgba(148,163,184,.06);border:1px solid rgba(148,163,184,.15);border-radius:0.4rem;padding:0.3rem 0.55rem}
+.cluster-node-name{font-family:monospace;font-size:0.72rem;color:var(--text)}
 @media(max-width:700px){.overview-table th:nth-child(4),.overview-table td:nth-child(4){display:none}}
 
 /* ── Status dots (health indicators) ── */
@@ -2190,8 +2196,7 @@ def _overview_page(username: str = "") -> str:
     <thead><tr>
       <th>ClearPass Server</th>
       <th>DNS &amp; ACME Provider</th>
-      <th>ECC Certificate</th>
-      <th>RSA Certificate</th>
+      <th>Certificate Services</th>
       <th>Next Renewal Check</th>
       <th></th>
     </tr></thead>
@@ -2803,9 +2808,47 @@ def _sched_cell(sc: dict) -> str:
             f'<div class="sched-sub">{_esc(sc.get("schedule", "—"))}</div>')
 
 
+def _service_badge(name: str, status: str) -> str:
+    cls = "badge-ok" if status == "installed" else "badge-none"
+    return f'<span class="badge {cls}">{_esc(name)} &middot; {_esc(status)}</span>'
+
+
+_OVERVIEW_COLSPAN = 5
+
+
+def _cluster_overview_row(s: dict) -> str:
+    """Inline cluster-node breakdown shown directly under a cluster-mode server's row."""
+    if not s.get("cluster_mode"):
+        return ""
+    nodes = s.get("cluster_nodes") or []
+    if not nodes:
+        body = '<span style="font-size:0.72rem;color:var(--subtle)">No cluster nodes discovered.</span>'
+    else:
+        chips = []
+        for node in nodes:
+            name = _esc(node.get("host") or "Unknown node")
+            if node.get("error"):
+                chips.append(
+                    f'<div class="cluster-node-chip"><span class="cluster-node-name">{name}</span>'
+                    f'<span class="badge badge-danger">{_esc(node["error"])}</span></div>'
+                )
+                continue
+            services = node.get("services") or []
+            if services:
+                badges = "".join(_service_badge(sv.get("service_name", ""), sv.get("status", ""))
+                                  for sv in services)
+            else:
+                badges = '<span style="font-size:0.7rem;color:var(--subtle)">No certificate service data</span>'
+            chips.append(f'<div class="cluster-node-chip"><span class="cluster-node-name">{name}</span>{badges}</div>')
+        body = "".join(chips)
+    return (f'<tr class="cluster-row"><td colspan="{_OVERVIEW_COLSPAN}">'
+            f'<div class="cluster-nodes-inline"><span class="cluster-lbl">Cluster nodes</span>{body}</div>'
+            f'</td></tr>')
+
+
 def _overview_rows(servers: list) -> str:
     if not servers:
-        return ('<tr><td colspan="6"><div class="empty">No servers configured. '
+        return (f'<tr><td colspan="{_OVERVIEW_COLSPAN}"><div class="empty">No servers configured. '
                 '<a href="/settings/add" style="color:var(--accent)">Add a server</a>.'
                 '</div></td></tr>')
     rows = []
@@ -2828,6 +2871,12 @@ def _overview_rows(servers: list) -> str:
                 f'<span style="color:var(--border2);margin:0 0.15rem">·</span>'
                 f'{_dot("cb")}<span style="font-size:0.68rem;color:var(--subtle)">Callback</span>'
                 f'</div>')
+        cert_badges = (
+            f'{_mini_cert(ecc, "HTTPS(ECC)")}'
+            f'{_mini_cert(rsa, "HTTPS(RSA)")}'
+            f'{_mini_cert(rsa, "RadSec")}'
+            f'{_mini_cert(rsa, "RADIUS")}'
+        )
         rows.append(
             f'<tr class="server-row" onclick="window.location.href=\'/server/{sid}\'">'
             f'<td>'
@@ -2838,13 +2887,13 @@ def _overview_rows(servers: list) -> str:
             f'{dns}'
             f'<div style="font-size:0.65rem;color:var(--subtle);margin-top:0.18rem">{acme}</div>'
             f'</td>'
-            f'<td>{_mini_cert(ecc, "ECC", "HTTPS · Web Interface")}</td>'
-            f'<td>{_mini_cert(rsa, "RSA", "RADIUS · 802.1X")}</td>'
+            f'<td><div class="cert-badges">{cert_badges}</div></td>'
             f'<td>{_sched_cell(s.get("schedule", {}))}</td>'
             f'<td style="text-align:right">'
             f'<a href="/server/{sid}" class="btn btn-ghost" onclick="event.stopPropagation()">Details &#8594;</a>'
             f'</td></tr>'
         )
+        rows.append(_cluster_overview_row(s))
     return "".join(rows)
 
 
@@ -3200,11 +3249,33 @@ function fmtDate(iso){if(!iso)return'—';try{return new Date(iso).toLocaleDateS
 function dnsLabel(p){var m={cloudflare:'Cloudflare',porkbun:'Porkbun',route53:'AWS Route 53',digitalocean:'DigitalOcean',godaddy:'GoDaddy',infoblox:'Infoblox',rfc2136:'RFC 2136'};return m[p]||p||'—';}
 function acmeLabel(s){var m={letsencrypt:"Let's Encrypt",letsencrypt_test:"Let's Encrypt (Staging)",zerossl:'ZeroSSL',buypass:'Buypass',buypass_test:'Buypass (Staging)'};return m[s]||(s&&s.startsWith('http')?'Custom CA':s)||'—';}
 
-function renderMiniCert(cert,label,svc){
-  var svcHtml=svc?'<div class="mini-svc">'+esc(svc)+'</div>':'';
-  if(!cert||!cert.exists){return'<div class="mini-cert none"><div class="mini-days none">—</div><div class="mini-label">'+esc(label)+'</div><div class="mini-exp">Not found</div>'+svcHtml+'</div>';}
+function renderMiniCert(cert,label){
+  if(!cert||!cert.exists){return'<div class="mini-cert none"><div class="mini-days none">—</div><div class="mini-label">'+esc(label)+'</div><div class="mini-exp">Not found</div></div>';}
   var d=cert.days_left,c=cls(d);
-  return'<div class="mini-cert '+c+'"><div class="mini-days '+c+'">'+(d!=null?d:'—')+'</div><div class="mini-label">days &middot; '+esc(label)+'</div><div class="mini-exp">'+esc(fmtDate(cert.not_after))+'</div>'+svcHtml+'</div>';
+  return'<div class="mini-cert '+c+'"><div class="mini-days '+c+'">'+(d!=null?d:'—')+'</div><div class="mini-label">days &middot; '+esc(label)+'</div><div class="mini-exp">'+esc(fmtDate(cert.not_after))+'</div></div>';
+}
+function svcBadge(name,status){
+  var c=status==='installed'?'badge-ok':'badge-none';
+  return'<span class="badge '+c+'">'+esc(name)+' &middot; '+esc(status)+'</span>';
+}
+function renderClusterRow(s){
+  if(!s.cluster_mode)return'';
+  var nodes=s.cluster_nodes||[];
+  var body;
+  if(!nodes.length){
+    body='<span style="font-size:0.72rem;color:var(--subtle)">No cluster nodes discovered.</span>';
+  }else{
+    body=nodes.map(function(node){
+      var name=esc(node.host||'Unknown node');
+      if(node.error){
+        return'<div class="cluster-node-chip"><span class="cluster-node-name">'+name+'</span><span class="badge badge-danger">'+esc(node.error)+'</span></div>';
+      }
+      var services=node.services||[];
+      var badges=services.length?services.map(function(sv){return svcBadge(sv.service_name,sv.status);}).join(''):'<span style="font-size:0.7rem;color:var(--subtle)">No certificate service data</span>';
+      return'<div class="cluster-node-chip"><span class="cluster-node-name">'+name+'</span>'+badges+'</div>';
+    }).join('');
+  }
+  return'<tr class="cluster-row"><td colspan="5"><div class="cluster-nodes-inline"><span class="cluster-lbl">Cluster nodes</span>'+body+'</div></td></tr>';
 }
 function renderSched(sc){sc=sc||{};return'<div class="sched-next">'+esc(sc.until||'—')+'</div><div class="sched-label">until next check</div><div class="sched-sub">'+esc(sc.schedule||'—')+'</div>';}
 function ovDot(sid,kind){
@@ -3228,15 +3299,17 @@ function renderRow(s){
   var sid=s.id||'';
   var ecc=(s.certs&&s.certs.ecc)||{exists:false};
   var rsa=(s.certs&&s.certs.rsa)||{exists:false};
+  var certBadges=renderMiniCert(ecc,'HTTPS(ECC)')+renderMiniCert(rsa,'HTTPS(RSA)')+renderMiniCert(rsa,'RadSec')+renderMiniCert(rsa,'RADIUS');
   return'<tr class="server-row" data-sid="'+esc(sid)+'" onclick="nav(this)">'
     +'<td><div class="srv-label">'+esc(s.label||s.cppm_host)+'</div>'
     +'<div class="srv-host">'+esc(s.cppm_host)+'</div>'
     +renderDots(sid)+'</td>'
     +'<td>'+esc(dnsLabel(s.dns_provider))
     +'<div style="font-size:0.65rem;color:var(--subtle);margin-top:0.18rem">'+esc(acmeLabel(s.acme_server))+'</div></td>'
-    +'<td>'+renderMiniCert(ecc,'ECC','HTTPS \xb7 Web Interface')+'</td><td>'+renderMiniCert(rsa,'RSA','RADIUS \xb7 802.1X')+'</td>'
+    +'<td><div class="cert-badges">'+certBadges+'</div></td>'
     +'<td>'+renderSched(s.schedule)+'</td>'
-    +'<td style="text-align:right"><a href="/server/'+esc(sid)+'" class="btn btn-ghost" onclick="event.stopPropagation()">Details &#8594;</a></td></tr>';
+    +'<td style="text-align:right"><a href="/server/'+esc(sid)+'" class="btn btn-ghost" onclick="event.stopPropagation()">Details &#8594;</a></td></tr>'
+    +renderClusterRow(s);
 }
 
 function applyDot(el,h){var s=h.status||'unknown',m=h.message||'';el.className='sdot '+s;var tip=m?(s+': '+m):s;el.title=tip;el.dataset.tooltip=tip;}
