@@ -661,11 +661,20 @@ def _serve_pkcs12_and_upload(
     # Resolve the CPPM hostname to IPs so the callback server only responds
     # to requests from the configured ClearPass host.
     _allowed_ips: set = set()
-    try:
-        for _ai in _socket.getaddrinfo(host, None):
-            _allowed_ips.add(_ai[4][0])
-    except OSError:
-        pass
+    configured_allowed_hosts = os.environ.get("CPPM_CALLBACK_ALLOWED_HOSTS", "")
+    if configured_allowed_hosts:
+        for allowed_host in configured_allowed_hosts.split(","):
+            try:
+                for _ai in _socket.getaddrinfo(allowed_host.strip(), None):
+                    _allowed_ips.add(_ai[4][0])
+            except OSError:
+                log.warning("  Callback: could not resolve allowed cluster host %s", allowed_host)
+    else:
+        try:
+            for _ai in _socket.getaddrinfo(host, None):
+                _allowed_ips.add(_ai[4][0])
+        except OSError:
+            pass
     if _allowed_ips:
         log.debug("  Callback allowlist: %s → %s", host, sorted(_allowed_ips))
     else:
@@ -1031,12 +1040,31 @@ def _cluster_hosts(api: ApiPlatformCertificates, current_host: str) -> list[str]
     _check_response(raw, "get_cluster_server")
 
     items = _items_from_response(raw)
+    import ipaddress
+    import socket
     hosts: list[str] = []
-    keys = ("ip_address", "server_ip", "ip", "hostname", "fqdn", "host")
     for item in items:
         if not isinstance(item, dict):
             continue
-        value = next((str(item.get(key, "")).strip() for key in keys if item.get(key)), "")
+        value = ""
+        for key in ("ip_address", "server_ip", "ip"):
+            candidate = str(item.get(key, "")).strip()
+            if candidate:
+                try:
+                    ipaddress.ip_address(candidate)
+                    value = candidate
+                    break
+                except ValueError:
+                    pass
+        if not value:
+            for key in ("hostname", "fqdn", "host", "server_name"):
+                candidate = str(item.get(key, "")).strip()
+                if candidate:
+                    try:
+                        value = socket.gethostbyname(candidate)
+                        break
+                    except OSError:
+                        pass
         if value and value not in hosts:
             hosts.append(value)
     if not hosts:
@@ -1052,7 +1080,11 @@ def _run_cluster_uploads(args: argparse.Namespace, hosts: list[str]) -> int:
     child_env = {**os.environ, "CPPM_CLUSTER_MODE": "false"}
     for host in hosts:
         log.info("Cluster mode: uploading to node %s", host)
-        node_env = {**child_env, "CPPM_HOST": host}
+        node_env = {
+            **child_env,
+            "CPPM_HOST": host,
+            "CPPM_CALLBACK_ALLOWED_HOSTS": ",".join(hosts),
+        }
         result = subprocess.run(
             [sys.executable, __file__, *sys.argv[1:]], env=node_env, check=False
         )

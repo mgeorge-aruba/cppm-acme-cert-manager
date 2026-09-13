@@ -276,6 +276,33 @@ def _api_items(data) -> list[dict]:
     return []
 
 
+def _node_address(node: dict) -> tuple[str, str]:
+    """Return (display_name, reachable_address) for a cluster node."""
+    import ipaddress
+    import socket
+
+    display = next((str(node.get(k, "")).strip() for k in
+                    ("server_name", "hostname", "fqdn", "host", "ip_address")
+                    if node.get(k)), "Unknown node")
+    for key in ("ip_address", "server_ip", "ip"):
+        value = str(node.get(key, "")).strip()
+        if value:
+            try:
+                ipaddress.ip_address(value)
+                return display, value
+            except ValueError:
+                pass
+    for key in ("hostname", "fqdn", "host", "server_name"):
+        value = str(node.get(key, "")).strip()
+        if value:
+            try:
+                resolved = socket.gethostbyname(value)
+                return display, resolved
+            except OSError:
+                pass
+    return display, ""
+
+
 def _fetch_cluster_node_status(server: dict) -> list[dict]:
     """Return per-node server certificate service status for cluster mode."""
     try:
@@ -303,13 +330,10 @@ def _fetch_cluster_node_status(server: dict) -> list[dict]:
         ).get_cluster_server()
         result = []
         for node in _api_items(nodes_raw):
-            node_host = next(
-                (str(node.get(k, "")).strip() for k in
-                 ("ip_address", "server_ip", "ip", "hostname", "fqdn", "host")
-                 if node.get(k)), ""
-            )
-            if not node_host:
-                continue
+          node_name, node_host = _node_address(node)
+          if not node_host:
+            result.append({"host": node_name, "services": [], "error": "Node address does not resolve"})
+            continue
             node_api = ApiPlatformCertificates(
                 server=f"https://{node_host}/api", api_token=token,
                 verify_ssl=verify, timeout=8,
@@ -323,7 +347,7 @@ def _fetch_cluster_node_status(server: dict) -> list[dict]:
                         "service_id": item.get("service_id"),
                         "status": "installed" if item.get("enabled", True) else "disabled",
                     })
-            result.append({"host": node_host, "services": services})
+            result.append({"host": node_name, "address": node_host, "services": services})
         return result
     except Exception as exc:
         _log.warning("cluster status unavailable for %s: %s", server.get("cppm_host", "?"), exc)
