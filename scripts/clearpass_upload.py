@@ -291,6 +291,7 @@ def _check_response(data: Any, operation: str) -> None:
 
 def ensure_letsencrypt_chain_trusted(
     api: ApiPlatformCertificates, ca_cert_paths: list[str],
+    radius_required: bool = False,
     radsec_required: bool = False,
 ) -> dict:
     """
@@ -308,7 +309,9 @@ def ensure_letsencrypt_chain_trusted(
     """
     log.info("=" * 62)
     log.info("Step 0: ACME CA Trust List Pre-flight")
-    required_usages = ["EAP", "Others"]
+    required_usages = ["Others"]
+    if radius_required:
+        required_usages.insert(0, "EAP")
     if radsec_required:
         required_usages.append("RadSec")
     log.info("  Required trust usages: %s", ", ".join(required_usages))
@@ -429,12 +432,12 @@ def ensure_letsencrypt_chain_trusted(
             usage_raw = existing.get("cert_usage", [])
             if isinstance(usage_raw, list):
                 usage_strs = [str(u) for u in usage_raw]
-                eap_ok    = "EAP"    in usage_strs
+                eap_ok    = not radius_required or "EAP" in usage_strs
                 others_ok = "Others" in usage_strs
                 radsec_ok = not radsec_required or "RadSec" in usage_strs
             else:
                 usage_int = int(usage_raw) if usage_raw else 0
-                eap_ok    = bool(usage_int & 2)
+                eap_ok    = not radius_required or bool(usage_int & 2)
                 others_ok = bool(usage_int & 16)
                 # The SDK exposes usage as an array, so numeric legacy values
                 # cannot safely identify the RadSec bit. Patch them when RadSec
@@ -1198,7 +1201,9 @@ def main() -> int:
         log.info("== Mode: Trust List Verification Only =======================")
         try:
             summary = ensure_letsencrypt_chain_trusted(
-                api, ca_paths, radsec_required=not args.skip_radsec
+                api, ca_paths,
+                radius_required=not args.skip_radius,
+                radsec_required=not args.skip_radsec,
             )
             if summary["failed"]:
                 status_write("WARN", "TRUST",
@@ -1218,7 +1223,9 @@ def main() -> int:
         log.info("== Step 0: Trust List Pre-flight ============================")
         try:
             summary = ensure_letsencrypt_chain_trusted(
-                api, ca_paths, radsec_required=not args.skip_radsec
+                api, ca_paths,
+                radius_required=not args.skip_radius,
+                radsec_required=not args.skip_radsec,
             )
             if summary["failed"]:
                 soft_errors.append(
