@@ -10,10 +10,12 @@ on the host.
 
 Two certificates are issued and maintained simultaneously:
 
-| Certificate | Algorithm | CPPM Service | Purpose |
+| Certificate target | Algorithm | CPPM Service | Purpose |
 |---|---|---|---|
-| ECC (P-256) | ECDSA | HTTPS(ECC) | Web UI and API access |
-| RSA (2048) | RSA | RADIUS | 802.1X / EAP authentication |
+| HTTPS (ECC) | ECDSA | HTTPS(ECC) | Web UI and API access |
+| HTTPS (RSA) | RSA | HTTPS(RSA) | Web UI and API access |
+| RADIUS | RSA | RADIUS | 802.1X / EAP authentication |
+| RadSec | RSA | RadSec | RADIUS over TLS authentication |
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -24,22 +26,24 @@ Two certificates are issued and maintained simultaneously:
 │  │  (supercronic│          │  (Cloudflare,   │                           │
 │  │   2x daily)  │          │   Porkbun, etc) │                           │
 │  └──────┬───────┘          └─────────────────┘                           │
-│         │ ECC + RSA certs issued/renewed                                 │
+│         │ One ECC and/or RSA cert issued/renewed                          │
 │         ▼                                                                │
 │  ┌──────────────┐  PKCS12 + REST API  ┌──────────────────────────────┐   │
 │  │ deploy_hook  │────────────────────►│  clearpass_upload.py         │   │
 │  │    .sh       │                     │  (pyclearpass SDK)           │   │
 │  └──────────────┘                     │                              │   │
 │                                       │  Step 0: ACME CA Trust List  │   │
-│                                       │  Step 1: PUT HTTPS(ECC) cert │   │
-│                                       │  Step 2: PUT RADIUS(RSA) cert│   │
-│                                       │  Step 3: Verify              │   │
+│                                       │  Step 1: PUT selected HTTPS  │   │
+│                                       │  Step 2: PUT selected RADIUS │   │
+│                                       │  Step 3: PUT selected RadSec │   │
+│                                       │  Step 4: Verify              │   │
 │                                       └──────────────┬───────────────┘   │
 │                                                      │                   │
 │                                              ┌───────▼──────┐            │
 │                                              │     CPPM     │            │
-│                                              │  HTTPS(ECC)  │            │
-│                                              │  RADIUS(RSA) │            │
+│                                              │  HTTPS RSA/ECC│           │
+│                                              │  RADIUS       │            │
+│                                              │  RadSec       │            │
 │                                              └──────────────┘            │
 │                                                                          │
 │  Persistent storage: /opt/cppm-certs (host) ◄──── /data/certs (container)│
@@ -152,7 +156,14 @@ cppm-acme-cert-manager/
 │   ├── startup.log                           ← Container boot log
 │   └── status_server.log                     ← Web UI process log
 │
-├── cppm.example.com/                         ← Per-server directory (one per ClearPass host)
+├── certificates/                             ← Shared ACME certificate profiles
+│   └── prod-arubasecurity/                   ← One ACME/Lego state per profile
+│       ├── <domain>.ecc.cer / .ecc.key / ...
+│       ├── <domain>.rsa.cer / .rsa.key / ...
+│       ├── lego-ecc/ and lego-rsa/
+│       └── .logs/acme_renewal.log
+│
+├── cppm.example.com/                         ← Legacy per-server directory
 │   ├── status.log                            ← Activity log (web UI Activity tab, public)
 │   ├── <domain>.ecc.cer / .ecc.key / ...     ← ECC cert files (flat layout, identical to acme.sh output)
 │   ├── <domain>.rsa.cer / .rsa.key / ...     ← RSA cert files
@@ -162,9 +173,56 @@ cppm-acme-cert-manager/
 │       ├── acme_renewal.log                  ← Lego issuance/renewal detail (auth required)
 │       └── cppm_upload.log                   ← ClearPass API upload detail (auth required)
 │
-└── cppm-lab.example.com/                     ← Second server (same structure)
+└── cppm-lab.example.com/                     ← Legacy second server
     └── ...
 ```
+
+### Shared Certificates Across ClearPass Targets
+
+Each ClearPass entry has a **Certificate Profile ID** in the web UI. Give
+multiple ClearPass entries the same profile ID to share one ACME certificate —
+useful when the same certificate needs to be installed on several independent
+ClearPass Policy Managers.
+
+When you open **+ Add Server** and at least one profile already exists, a
+**Certificate Profile** dropdown appears above the Certificate Profile ID field:
+
+- **+ Create new certificate profile** (default) — Domain, SAN DNS, ACME
+  Email, Certificate Authority, DNS Provider, and Certificate Types are all
+  entered manually, same as before.
+- **Selecting an existing profile** — those same fields are auto-populated
+  from the matching server entry and locked (read-only/greyed out), since
+  they're shared by every server on that profile. Only the ClearPass-specific
+  fields (Label, Host/IP, Cluster mode, Client ID/Secret, Callback Host/Port,
+  Verify SSL) need to be entered manually. To change a shared value later,
+  edit any existing server on that profile — the update applies to every
+  server sharing the profile ID the next time each is saved.
+
+The manager issues or renews ECC/RSA once per profile, then uploads the
+resulting certificate sequentially to every associated target.
+
+The ACME Provider section also accepts up to 10 optional **SAN DNS** names.
+They are included in every ECC/RSA certificate alongside the primary domain.
+
+### Cluster Mode
+
+Enable **Cluster mode** on a ClearPass target to upload the selected
+certificates to every node returned by `GET /api/cluster/server`. The
+configured API client, secret, and callback host are reused for each node;
+each node's management IP is used directly (falling back to DNS resolution of
+its hostname) so uploads and status checks work even when a node's FQDN isn't
+resolvable from the Docker host. Cluster uploads run sequentially, and HTTPS
+targets remain last because ClearPass may restart web services after an HTTPS
+certificate update.
+
+Both the Dashboard and the per-server detail page show a **Cluster Nodes**
+breakdown for any cluster-mode server — each node listed on its own line with
+its hostname, management IP, and per-service (HTTPS(ECC), HTTPS(RSA), RADIUS,
+RadSec) install status, or an error badge if a node couldn't be reached.
+
+Use **Force Certificate Issue** to renew the shared profile and upload it to all
+associated targets. Use **Force Upload** when only one target needs its existing
+certificate installed; this does not contact the ACME provider.
 
 ---
 
@@ -190,6 +248,11 @@ chmod +x setup.sh && ./setup.sh
 `setup.sh` verifies Docker, creates `/opt/cppm-certs`, and copies
 `docker-compose.override.yml.example` to `docker-compose.override.yml` if it
 does not already exist.
+
+The Compose service uses Cloudflare and Google public DNS resolvers for reliable
+DNS-01 zone discovery. If your network blocks those resolvers, override the
+service DNS settings in `docker-compose.override.yml` with resolvers reachable
+from your Docker host.
 
 ### 3. Configure local overrides (optional)
 
@@ -280,10 +343,14 @@ domain, and ACME settings — is entered here and stored in `servers.json`.
 
 | Section | Fields |
 |---|---|
-| **Identity** | Friendly label (e.g. `Production ClearPass`) |
-| **ClearPass** | Host/IP, Client ID, Client Secret, Cert Passphrase, Callback Host, Callback Port, Verify SSL |
-| **Domain & ACME** | Domain, ACME email, Certificate Authority |
+| **Identity** | Friendly label (e.g. `Production ClearPass`), and a Certificate Profile — reuse an existing profile from the dropdown or create a new one (see [Shared Certificates Across ClearPass Targets](#shared-certificates-across-clearpass-targets)) |
+| **ClearPass** | Host/IP, Cluster mode, Client ID, Client Secret, Cert Passphrase, Callback Host, Callback Port, Verify SSL |
+| **Domain & ACME** | Domain, up to 10 SAN DNS names, ACME email, Certificate Authority, Certificate Types (HTTPS(ECC)/HTTPS(RSA)/RADIUS/RadSec) |
 | **DNS Provider** | Provider selector + credentials (see table below) |
+
+> Domain, SAN DNS, ACME, DNS Provider, and Certificate Types are locked
+> (read-only) when reusing an existing Certificate Profile — see
+> [Shared Certificates Across ClearPass Targets](#shared-certificates-across-clearpass-targets).
 
 #### CLI method
 
@@ -367,7 +434,7 @@ entrypoint.sh
                                                     │     cert_usage: ["EAP", "Others"]
                                                     │
                                                     ├── Step 1: ECC → HTTPS(ECC)
-                                                    │     GET  /api/cluster/server/publisher  (UUID)
+                                                    │     GET  /api/cluster/server/this  (UUID)
                                                     │     GET  /api/server-cert  (find HTTPS(ECC) slot)
                                                     │     PUT  /api/server-cert/name/{uuid}/HTTPS(ECC)
                                                     │     CPPM fetches PKCS12 via CPPM_CALLBACK_HOST
@@ -472,11 +539,15 @@ The main page shows a table with one row per configured ClearPass server.
 
 | Column | What you see |
 |---|---|
-| **ClearPass Server** | Friendly label and host address |
+| **ClearPass Server** | Friendly label and host address, plus live status dots for ClearPass, DNS, and the PKCS12 callback |
 | **DNS & ACME Provider** | DNS provider with the ACME certificate authority listed below |
-| **ECC Certificate** | Days remaining (colour-coded), expiry date, HTTPS · Web Interface label |
-| **RSA Certificate** | Days remaining (colour-coded), expiry date, RADIUS · 802.1X label |
+| **Certificate Services** | One badge per certificate target — HTTPS(ECC), HTTPS(RSA), RadSec, RADIUS — each showing days remaining (colour-coded) and expiry date. HTTPS(RSA), RadSec, and RADIUS share the same RSA certificate |
 | **Next Renewal Check** | Countdown to the next scheduled renewal run and the cron schedule |
+
+For any server with **Cluster mode** enabled, a row directly beneath it lists
+every cluster node on its own line — hostname, management IP, and its
+certificate-service install status — so cluster health is visible from the
+dashboard without opening the server detail page.
 
 The table refreshes every 30 seconds. Click any row or **Details →** to open
 the per-server detail view.
@@ -485,11 +556,13 @@ the per-server detail view.
 
 ![Per-server detail view](docs/ui-server-detail.png)
 
-Shows the full certificate status for one server: cert cards with days
-remaining, expiry, issuer and key type; renewal schedule; Configuration card
-with service connectivity status lights for the DNS provider and ClearPass host;
-and the last 40 activity log entries. Click **View Details** on a cert card to
-inspect the full decoded certificate with a PEM copy button.
+Shows the full certificate status for one server: four cert cards —
+HTTPS(ECC), HTTPS(RSA), RADIUS, RadSec — with days remaining, expiry, issuer
+and key type; a **Cluster Nodes** card (cluster-mode servers only) listing
+every node's per-service install status; renewal schedule; a Configuration
+card with service connectivity status lights for the DNS provider and
+ClearPass host; and the last 40 activity log entries. Click **View Details**
+on a cert card to inspect the full decoded certificate with a PEM copy button.
 
 ### Servers page — ClearPass server configuration
 
@@ -1016,7 +1089,7 @@ https://cppm.example.com/api-docs/
 | `GET` | `/api/cert-trust-list` | Fetch trust list entries |
 | `POST` | `/api/cert-trust-list` | Add LE CA cert to trust list |
 | `PATCH` | `/api/cert-trust-list/{id}` | Patch trust list flags |
-| `GET` | `/api/cluster/server/publisher` | Get publisher server UUID |
+| `GET` | `/api/cluster/server/this` | Get the connected server's own UUID |
 | `GET` | `/api/server-cert` | List server cert slots |
 | `PUT` | `/api/server-cert/name/{uuid}/HTTPS(ECC)` | Upload ECC cert |
 | `PUT` | `/api/server-cert/name/{uuid}/RADIUS` | Upload RSA cert |

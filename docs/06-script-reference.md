@@ -152,12 +152,12 @@ fixed port defined by `CPPM_CALLBACK_PORT`, exposed via `docker-compose.yml`.
 
 | Method | Path |
 |---|---|
-| `GET` | `/api/cluster/server/publisher` |
+| `GET` | `/api/cluster/server/this` |
 | `GET` | `/api/server-cert` |
 | `PUT` | `/api/server-cert/name/{server_uuid}/HTTPS(ECC)` |
 
-The publisher server UUID is fetched via
-`ApiLocalServerConfiguration.get_cluster_server_by_uuid(uuid="publisher")`.
+The server's own UUID is fetched via
+`ApiLocalServerConfiguration.get_cluster_server_by_uuid(uuid="this")`.
 The script prefers `HTTPS(ECC)` (service_id=2) then falls back to `HTTPS(RSA)`
 (service_id=7) then any HTTPS variant.
 

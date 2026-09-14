@@ -29,6 +29,13 @@ services:
     container_name: cppm-acme-cert-manager
     restart: unless-stopped
 
+    # Use stable public recursive resolvers for Lego DNS-01 zone discovery.
+    # Docker Desktop's internal forwarding resolver can intermittently time out
+    # on SOA lookups, which causes the Cloudflare provider to report SERVFAIL.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
     environment:
       # ── Container ────────────────────────────────────────────────────────────
       # Timezone for log timestamps and cron scheduling.

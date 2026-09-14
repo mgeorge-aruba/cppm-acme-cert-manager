@@ -88,6 +88,13 @@ class LegoProvider(AcmeProvider):
     def _cert_file(self, cert_dir: str, domain: str, kt: str) -> str:
         return os.path.join(self._lego_path(cert_dir, kt), "certificates", f"{domain}.crt")
 
+    def _eab_args(self, eab_kid: str, eab_hmac_key: str) -> list[str]:
+        if not eab_kid and not eab_hmac_key:
+            return []
+        if not eab_kid or not eab_hmac_key:
+            raise AcmeError("Both EAB_KID and EAB_HMAC_KEY are required for External Account Binding")
+        return ["--eab", "--kid", eab_kid, "--hmac", eab_hmac_key]
+
     def _run(
         self,
         args: list[str],
@@ -117,6 +124,7 @@ class LegoProvider(AcmeProvider):
         self,
         *,
         domain: str,
+        san_domains: list[str] | None = None,
         acme_server: str,
         cert_dir: str,
         key_types: list[str],
@@ -129,6 +137,10 @@ class LegoProvider(AcmeProvider):
         plugin = self._dns_plugin(dns_provider)
         lego_env = self._map_dns_env(dns_env)
         email = dns_env.get("ACME_EMAIL") or os.environ.get("ACME_EMAIL", "")
+        eab_args = self._eab_args(
+            dns_env.get("EAB_KID", ""), dns_env.get("EAB_HMAC_KEY", "")
+        )
+        san_domains = san_domains or []
         results: list[KeyTypeResult] = []
 
         log.info(
@@ -160,10 +172,12 @@ class LegoProvider(AcmeProvider):
                 "--accept-tos",
                 "--email",    email,
                 "--domains",  domain,
+                *sum((["--domains", san] for san in san_domains), []),
                 "--dns",      plugin,
                 "--path",     lego_path,
                 "--server",   server_url,
                 "--key-type", _KEY_TYPE_MAP[kt],
+                *eab_args,
                 "run",
                 "--always-deactivate-authorizations", "true",
             ]
@@ -182,6 +196,7 @@ class LegoProvider(AcmeProvider):
         self,
         *,
         domain: str,
+        san_domains: list[str] | None = None,
         acme_server: str,
         cert_dir: str,
         key_types: list[str],
@@ -193,6 +208,10 @@ class LegoProvider(AcmeProvider):
         plugin = self._dns_plugin(dns_provider)
         lego_env = self._map_dns_env(dns_env)
         email = dns_env.get("ACME_EMAIL") or os.environ.get("ACME_EMAIL", "")
+        eab_args = self._eab_args(
+            dns_env.get("EAB_KID", ""), dns_env.get("EAB_HMAC_KEY", "")
+        )
+        san_domains = san_domains or []
         results: list[KeyTypeResult] = []
         failures: list[str] = []
 
@@ -219,6 +238,7 @@ class LegoProvider(AcmeProvider):
                 "--path",     lego_path,
                 "--server",   server_url,
                 "--key-type", _KEY_TYPE_MAP[kt],
+                *eab_args,
                 "renew",
                 "--days", "30",
             ]

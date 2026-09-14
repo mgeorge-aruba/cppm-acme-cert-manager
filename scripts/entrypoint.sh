@@ -54,11 +54,9 @@ fi
 SERVER_IDS=$(python3 -c "
 import sys
 sys.path.insert(0, '/opt/cppm')
-from config_utils import load_servers
-for s in load_servers():
-    sid = s.get('id', '')
-    if sid:
-        print(sid)
+from config_utils import certificate_owner_ids
+for sid in certificate_owner_ids():
+    print(sid)
 " 2>/dev/null || echo "")
 
 if [[ -z "$SERVER_IDS" ]]; then
@@ -112,6 +110,35 @@ validate_dns_creds() {
             ;;
     esac
     return $missing
+}
+
+# Upload one shared certificate profile to every associated ClearPass target.
+upload_profile_targets() {
+    local profile_id="$1"
+    local member_ids
+    member_ids=$(python3 -c "
+import sys
+sys.path.insert(0, '/opt/cppm')
+from config_utils import certificate_members
+for s in certificate_members('${profile_id}'):
+    if s.get('id'):
+        print(s['id'])
+" 2>/dev/null || true)
+    for member_id in $member_ids; do
+        local member_env
+        member_env=$(python3 -c "
+import sys
+sys.path.insert(0, '/opt/cppm')
+from config_utils import get_server_shell_env
+output = get_server_shell_env('${member_id}')
+if output:
+    print(output)
+" 2>/dev/null) || true
+        [[ -z "$member_env" ]] && continue
+        log "  Uploading shared certificate profile ${profile_id} to target ${member_id}..."
+        ( eval "$member_env"; /opt/cppm/deploy_hook.sh ) 2>&1 | tee -a "$LOG" || \
+            err "Upload failed for target ${member_id} – check target upload log"
+    done
 }
 
 # ── Process certificates for each configured server ───────────────────────────
@@ -230,7 +257,7 @@ if output:
     if [[ "${FORCE_RENEW:-false}" == "true" ]]; then
         log "FORCE_RENEW=true – forcing full re-issuance for ${DOMAIN}..."
         status_write "INFO" "CERT" "FORCE_RENEW requested – starting re-issuance for ${DOMAIN}"
-        run_with_guard /opt/cppm/issue_cert.sh || true
+        SKIP_UPLOAD=true run_with_guard /opt/cppm/issue_cert.sh || true
 
     elif [[ "$FLAT_OK" == "true" ]]; then
         PRIMARY_EXPIRY=$(openssl x509 -enddate -noout -in "$PRIMARY_FLAT" 2>/dev/null \
@@ -259,12 +286,16 @@ except Exception:
     elif [[ "$LEGO_STATE_OK" == "true" ]]; then
         log "Lego cert state present but flat files missing for ${DOMAIN} – running install only..."
         status_write "INFO" "CERT" "Flat files missing for ${DOMAIN} – running install (no re-issue needed)"
-        run_with_guard /opt/cppm/install_cert.sh || true
+        SKIP_UPLOAD=true run_with_guard /opt/cppm/install_cert.sh || true
 
     else
         log "Certificates not found for ${DOMAIN} – issuing for the first time..."
         status_write "INFO" "CERT" "No certificates found for ${DOMAIN} – starting first-time issuance"
-        run_with_guard /opt/cppm/issue_cert.sh || true
+        SKIP_UPLOAD=true run_with_guard /opt/cppm/issue_cert.sh || true
+    fi
+
+    if [[ -f "$FLAT_ECC" || -f "$FLAT_RSA" ]]; then
+        upload_profile_targets "${CERTIFICATE_ID}"
     fi
 done
 

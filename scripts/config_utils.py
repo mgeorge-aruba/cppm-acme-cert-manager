@@ -59,6 +59,29 @@ def get_server(server_id: str) -> Optional[dict]:
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
+def certificate_targets(entry: dict) -> list[str]:
+    """Return normalized ClearPass targets, including legacy config values."""
+    targets = set(entry.get("cert_types") or [])
+    if "ecc" in targets:
+        targets.add("https_ecc")
+    if "rsa" in targets:
+        targets.update(("radius", "radsec"))
+    return [t for t in ("https_ecc", "https_rsa", "radius", "radsec") if t in targets]
+
+
+def san_dns_names(entry: dict) -> list[str]:
+    """Return up to ten normalized optional SAN DNS names."""
+    primary = str(entry.get("domain", "")).strip().lower()
+    values = entry.get("san_dns") or []
+    if isinstance(values, str):
+        values = values.replace(",", "\n").splitlines()
+    result: list[str] = []
+    for value in values:
+        name = str(value).strip().lower()
+        if name and name != primary and name not in result:
+            result.append(name)
+    return result[:10]
+
 def validate_server(entry: dict) -> None:
     """Raises ValueError on missing or invalid fields."""
     for field in _REQUIRED:
@@ -71,9 +94,10 @@ def validate_server(entry: dict) -> None:
             raise ValueError()
     except (ValueError, TypeError):
         raise ValueError("Callback port must be a number between 1 and 65535.")
-    cert_types = entry.get("cert_types") or []
-    if not any(t in cert_types for t in ("ecc", "rsa")):
-        raise ValueError("At least one certificate type (ECC or RSA) must be selected.")
+    cert_types = certificate_targets(entry)
+    valid_types = {"https_ecc", "https_rsa", "radius", "radsec"}
+    if not any(t in cert_types for t in valid_types):
+        raise ValueError("At least one ClearPass certificate target must be selected.")
 
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
@@ -92,8 +116,33 @@ def _check_duplicate_host(host: str, exclude_id: str = None) -> None:
             )
 
 
+def _inherit_certificate_profile(entry: dict, exclude_id: str = None) -> dict:
+    """Fill shared ACME fields from an existing explicit certificate profile."""
+    profile_id = str(entry.get("certificate_id", "")).strip()
+    if not profile_id:
+        return entry
+    for existing in load_servers():
+        if existing.get("id") == exclude_id:
+            continue
+        if str(existing.get("certificate_id", "")).strip() != profile_id:
+            continue
+        merged = dict(entry)
+        for field in (
+            "domain", "san_dns", "acme_email", "acme_server",
+            "dns_provider", "dns_credentials", "cert_types",
+        ):
+            if field in existing:
+                value = existing[field]
+                merged[field] = dict(value) if field == "dns_credentials" else (
+                    list(value) if isinstance(value, list) else value
+                )
+        return merged
+    return entry
+
+
 def add_server(entry: dict) -> str:
     """Validate, check for duplicate host, and append. Returns the assigned server ID."""
+    entry = _inherit_certificate_profile(dict(entry))
     validate_server(entry)
     _check_duplicate_host(entry.get("cppm_host", ""))
     entry = dict(entry)
@@ -106,6 +155,7 @@ def add_server(entry: dict) -> str:
 
 def update_server(server_id: str, entry: dict) -> bool:
     """Replace the existing entry with the given ID. Returns True if found."""
+    entry = _inherit_certificate_profile(dict(entry), exclude_id=server_id)
     validate_server(entry)
     _check_duplicate_host(entry.get("cppm_host", ""), exclude_id=server_id)
     servers = load_servers()
@@ -155,6 +205,7 @@ def migrate_from_env() -> Optional[str]:
         return None
 
     entry = {
+        "certificate_id": re.sub(r"[^\w.\-]", "_", domain).strip("._-") or "certificate",
         "label":                f"ClearPass ({cppm_host})",
         "cppm_host":            cppm_host,
         "cppm_client_id":       os.environ.get("CPPM_CLIENT_ID",       ""),
@@ -167,7 +218,7 @@ def migrate_from_env() -> Optional[str]:
         "acme_email":           os.environ.get("ACME_EMAIL",           ""),
         "acme_server":          os.environ.get("ACME_SERVER",          "letsencrypt"),
         "dns_provider":         os.environ.get("DNS_PROVIDER",         "cloudflare"),
-        "cert_types": ["ecc", "rsa"],
+        "cert_types": ["https_ecc", "https_rsa", "radius", "radsec"],
         "dns_credentials": {k: v for k, v in {
             "CF_Token":               os.environ.get("CF_Token",               ""),
             "CF_Account_ID":          os.environ.get("CF_Account_ID",          ""),
@@ -194,15 +245,61 @@ def migrate_from_env() -> Optional[str]:
 # ── Per-server directory ──────────────────────────────────────────────────────
 
 def server_cert_dir(server: dict) -> Path:
-    """Return the per-server directory path under the data volume root.
+    """Return the shared certificate directory, or legacy target directory.
 
     Named by the sanitized ClearPass hostname so the layout is human-readable:
-      /data/certs/cppm.example.com/
+    /data/certs/certificates/prod-example/
       /data/certs/cppm-lab.example.com/
     """
+    certificate_id = str(server.get("certificate_id", "")).strip()
+    if certificate_id:
+        safe = re.sub(r"[^\w.\-]", "_", certificate_id).strip("._-") or "certificate"
+        return SERVERS_FILE.parent / "certificates" / safe
+
     host = str(server.get("cppm_host", "")).strip()
     safe = re.sub(r"[^\w.\-]", "_", host).strip("._-") or "default"
     return SERVERS_FILE.parent / safe
+
+
+def certificate_id(server: dict) -> str:
+    """Return the shared certificate profile ID, or the legacy target ID."""
+    configured = str(server.get("certificate_id", "")).strip()
+    if configured:
+        return configured
+    host = str(server.get("cppm_host", "")).strip()
+    return re.sub(r"[^\w.\-]", "_", host).strip("._-") or "default"
+
+
+def certificate_members(profile_id: str) -> list[dict]:
+    """Return all ClearPass targets attached to a certificate profile."""
+    return [s for s in load_servers() if certificate_id(s) == profile_id]
+
+
+def list_certificate_profiles() -> list[dict]:
+    """Return one representative server entry per distinct *explicit* certificate
+    profile ID (the value typed into the Certificate Profile ID field — this is
+    what _inherit_certificate_profile matches on, not the host-based fallback)."""
+    profiles: list[dict] = []
+    seen: set[str] = set()
+    for server in load_servers():
+        profile_id = str(server.get("certificate_id", "")).strip()
+        if not profile_id or profile_id in seen:
+            continue
+        seen.add(profile_id)
+        profiles.append(server)
+    return profiles
+
+
+def certificate_owner_ids() -> list[str]:
+    """Return one target ID per certificate profile for ACME work."""
+    owners: list[str] = []
+    seen: set[str] = set()
+    for server in load_servers():
+        profile_id = certificate_id(server)
+        if profile_id not in seen and server.get("id"):
+            seen.add(profile_id)
+            owners.append(str(server["id"]))
+    return owners
 
 
 # ── Shell environment export ───────────────────────────────────────────────────
@@ -218,19 +315,26 @@ def get_server_env_dict(server_id: str) -> Optional[dict]:
 
     creds = s.get("dns_credentials") or {}
     env: dict[str, str] = {
+        "CERTIFICATE_ID":       certificate_id(s),
         "DOMAIN":               str(s.get("domain",               "")),
+        "SAN_DNS":              "|".join(san_dns_names(s)),
         "ACME_EMAIL":           str(s.get("acme_email",           "")),
         "ACME_SERVER":          str(s.get("acme_server",          "letsencrypt")),
         "DNS_PROVIDER":         str(s.get("dns_provider",         "")),
         "CPPM_HOST":            str(s.get("cppm_host",            "")),
+        "CPPM_CLUSTER_MODE":    "true" if s.get("cppm_cluster_mode") else "false",
         "CPPM_CLIENT_ID":       str(s.get("cppm_client_id",       "")),
         "CPPM_CLIENT_SECRET":   str(s.get("cppm_client_secret",   "")),
         "CPPM_VERIFY_SSL":      "true" if s.get("cppm_verify_ssl") else "false",
         "CPPM_CERT_PASSPHRASE": str(s.get("cppm_cert_passphrase", "")),
         "CPPM_CALLBACK_HOST":   str(s.get("cppm_callback_host",   "")),
         "CPPM_CALLBACK_PORT":   str(s.get("cppm_callback_port",   "8765")),
-        "ISSUE_ECC":            "true" if "ecc" in (s.get("cert_types") or ["ecc", "rsa"]) else "false",
-        "ISSUE_RSA":            "true" if "rsa" in (s.get("cert_types") or ["ecc", "rsa"]) else "false",
+        "ISSUE_ECC":            "true" if "https_ecc" in certificate_targets(s) else "false",
+        "ISSUE_RSA":            "true" if any(t in certificate_targets(s) for t in ("https_rsa", "radius", "radsec")) else "false",
+        "UPLOAD_HTTPS_ECC":     "true" if "https_ecc" in certificate_targets(s) else "false",
+        "UPLOAD_HTTPS_RSA":     "true" if "https_rsa" in certificate_targets(s) else "false",
+        "UPLOAD_RADIUS":        "true" if "radius" in certificate_targets(s) else "false",
+        "UPLOAD_RADSEC":        "true" if "radsec" in certificate_targets(s) else "false",
         "SERVER_CERT_DIR":      str(server_cert_dir(s)),
         "SERVER_LOG_DIR":       str(server_cert_dir(s) / ".logs"),
         "STATUS_LOG":           str(server_cert_dir(s) / "status.log"),

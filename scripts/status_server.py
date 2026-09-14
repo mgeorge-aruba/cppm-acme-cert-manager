@@ -45,7 +45,7 @@ from auth_utils import (
 )
 from config_utils import (
     load_servers, get_server, add_server, update_server, delete_server,
-    server_cert_dir, get_server_env_dict,
+  server_cert_dir, get_server_env_dict, certificate_members, list_certificate_profiles,
     get_server_notifications, update_server_notifications,
     get_traefik_config, save_traefik_config, get_traefik_log,
 )
@@ -239,7 +239,7 @@ def build_server_status(server: dict) -> dict:
     tz       = _tz()
     domain   = server.get("domain", "")
     cert_dir = server_cert_dir(server)
-    return {
+    status = {
         "id":              server.get("id", ""),
         "label":           server.get("label", domain),
         "cppm_host":       server.get("cppm_host", ""),
@@ -252,10 +252,114 @@ def build_server_status(server: dict) -> dict:
             "ecc": parse_cert(cert_dir / f"{domain}.ecc.cer"),
             "rsa": parse_cert(cert_dir / f"{domain}.rsa.cer"),
         },
+        "targets": server.get("cert_types") or ["https_ecc", "https_rsa", "radius", "radsec"],
+        "cluster_mode": bool(server.get("cppm_cluster_mode", False)),
+        "cluster_nodes": [],
         "schedule":    next_check_info(),
         "activity":    parse_log(server, 40),
         "server_time": datetime.datetime.now(tz).isoformat(),
     }
+    if status["cluster_mode"]:
+        status["cluster_nodes"] = _fetch_cluster_node_status(server)
+    return status
+
+
+def _api_items(data) -> list[dict]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        embedded = data.get("_embedded")
+        if isinstance(embedded, dict) and isinstance(embedded.get("items"), list):
+            return [item for item in embedded["items"] if isinstance(item, dict)]
+        if isinstance(data.get("items"), list):
+            return [item for item in data["items"] if isinstance(item, dict)]
+    return []
+
+
+def _node_address(node: dict) -> tuple[str, str]:
+    """Return (display_name, reachable_address) for a cluster node."""
+    import ipaddress
+    import socket
+
+    display = next((str(node.get(k, "")).strip() for k in
+            ("fqdn", "server_dns_name", "name", "hostname", "host", "ip_address")
+                    if node.get(k)), "Unknown node")
+    for key in ("management_ip", "ip_address", "server_ip", "ip"):
+        value = str(node.get(key, "")).strip()
+        if value:
+            try:
+                ipaddress.ip_address(value)
+                return display, value
+            except ValueError:
+                pass
+    for key in ("hostname", "fqdn", "host", "server_name"):
+        value = str(node.get(key, "")).strip()
+        if value:
+            try:
+                resolved = socket.gethostbyname(value)
+                return display, resolved
+            except OSError:
+                pass
+    return display, ""
+
+
+def _fetch_cluster_node_status(server: dict) -> list[dict]:
+    """Return per-node server certificate service status for cluster mode."""
+    try:
+        import requests
+        from pyclearpass.api_localserverconfiguration import ApiLocalServerConfiguration
+
+        host = server.get("cppm_host", "")
+        verify = bool(server.get("cppm_verify_ssl", False))
+        response = requests.post(
+            f"https://{host}/api/oauth",
+            data={"grant_type": "client_credentials",
+                  "client_id": server.get("cppm_client_id", ""),
+                  "client_secret": server.get("cppm_client_secret", "")},
+            timeout=8, verify=verify,
+        )
+        response.raise_for_status()
+        token = response.json().get("access_token", "")
+        nodes_raw = ApiLocalServerConfiguration(
+          server=f"https://{host}/api", api_token=token,
+          verify_ssl=verify, timeout=8,
+        ).get_cluster_server()
+        result = []
+        for node in _api_items(nodes_raw):
+          node_name, node_host = _node_address(node)
+          if not node_host:
+            result.append({"host": node_name, "services": [], "error": "Node address does not resolve"})
+            continue
+          node_response = requests.get(
+            f"https://{node_host}/api/server-cert",
+            headers={"Authorization": f"Bearer {token}", "Host": node_name},
+            verify=verify, timeout=8, allow_redirects=False,
+          )
+          # ClearPass may redirect an IP request to its configured FQDN. Keep
+          # the request pinned to management_ip because that FQDN may not
+          # resolve from the Docker host.
+          if 300 <= node_response.status_code < 400:
+            node_response = requests.get(
+              f"https://{node_host}/api/server-cert",
+              headers={"Authorization": f"Bearer {token}", "Host": node_name},
+              verify=verify, timeout=8, allow_redirects=False,
+            )
+          node_response.raise_for_status()
+          node_data = node_response.json()
+          services = []
+          for item in _api_items(node_data):
+              name = str(item.get("service_name", ""))
+              if name in ("HTTPS(ECC)", "HTTPS(RSA)", "RADIUS", "RadSec"):
+                  services.append({
+                      "service_name": name,
+                      "service_id": item.get("service_id"),
+                      "status": "installed" if item.get("enabled", True) else "disabled",
+                  })
+          result.append({"host": node_name, "address": node_host, "services": services})
+        return result
+    except Exception as exc:
+        _log.warning("cluster status unavailable for %s: %s", server.get("cppm_host", "?"), exc)
+        return [{"host": server.get("cppm_host", ""), "services": [], "error": str(exc)}]
 
 
 def build_all_status() -> list:
@@ -657,7 +761,7 @@ def _check_expiry_warnings() -> None:
 _ISSUE_SCRIPT = Path("/opt/cppm/issue_cert.sh")
 
 def _spawn_cert_pipeline(server_id: str, force: bool = False) -> None:
-    """Run issue_cert.sh for server_id in a background daemon thread."""
+    """Issue one shared profile, then upload it to every associated target."""
     def _run():
         if not _ISSUE_SCRIPT.exists():
             _log.warning("cert pipeline: %s not found (not in container?)", _ISSUE_SCRIPT)
@@ -667,11 +771,31 @@ def _spawn_cert_pipeline(server_id: str, force: bool = False) -> None:
             _log.error("cert pipeline: server %s not found", server_id)
             return
         Path(env_dict["SERVER_LOG_DIR"]).mkdir(parents=True, exist_ok=True)
-        env = {**os.environ, **env_dict, "FORCE_RENEW": "true" if force else "false"}
+        env = {
+            **os.environ, **env_dict,
+            "FORCE_RENEW": "true" if force else "false",
+            "SKIP_UPLOAD": "true",
+        }
         _log.info("cert pipeline: starting for %s (force=%s)", server_id, force)
         try:
             rc = subprocess.run([str(_ISSUE_SCRIPT)], env=env, check=False).returncode
             _log.info("cert pipeline: finished for %s (rc=%d)", server_id, rc)
+            if rc == 0:
+                for member in certificate_members(env_dict["CERTIFICATE_ID"]):
+                    member_env = get_server_env_dict(str(member.get("id", "")))
+                    if not member_env:
+                        continue
+                    Path(member_env["SERVER_LOG_DIR"]).mkdir(parents=True, exist_ok=True)
+                    upload_env = {**os.environ, **member_env}
+                    _log.info(
+                        "cert pipeline: uploading shared profile %s to %s",
+                        env_dict["CERTIFICATE_ID"], member.get("cppm_host", member.get("id")),
+                    )
+                    upload_rc = subprocess.run(
+                        [str(_DEPLOY_SCRIPT)], env=upload_env, check=False
+                    ).returncode
+                    if upload_rc != 0:
+                        _log.error("cert pipeline: upload failed for target %s (rc=%d)", member.get("id"), upload_rc)
         except Exception as exc:
             _log.error("cert pipeline: error for %s: %s", server_id, exc)
 
@@ -745,11 +869,16 @@ def _parse_server_form(f: dict) -> dict:
     """Convert POST form data into a server config dict."""
     provider  = f.get("dns_provider", "cloudflare")
     cred_keys = _DNS_CRED_FIELDS.get(provider, [])
+    if f.get("acme_server", "letsencrypt") == "zerossl":
+        cred_keys = [*cred_keys, "EAB_KID", "EAB_HMAC_KEY"]
     acme_sel  = f.get("acme_server", "letsencrypt")
     acme_server = f.get("acme_server_url", "").strip() if acme_sel == "custom" else acme_sel
+    san_dns = [f.get(f"san_dns_{i}", "").strip().lower() for i in range(1, 11)]
     return {
         "label":                f.get("label", "").strip(),
+        "certificate_id":       f.get("certificate_id", "").strip(),
         "cppm_host":            f.get("cppm_host", "").strip(),
+        "cppm_cluster_mode":   f.get("cppm_cluster_mode", "") == "true",
         "cppm_client_id":       f.get("cppm_client_id", "").strip(),
         "cppm_client_secret":   f.get("cppm_client_secret", ""),
         "cppm_verify_ssl":      f.get("cppm_verify_ssl", "") == "true",
@@ -757,12 +886,13 @@ def _parse_server_form(f: dict) -> dict:
         "cppm_callback_host":   f.get("cppm_callback_host", "").strip(),
         "cppm_callback_port":   f.get("cppm_callback_port", "8765").strip() or "8765",
         "domain":               f.get("domain", "").strip(),
+        "san_dns":              [name for name in san_dns if name],
         "acme_email":           f.get("acme_email", "").strip(),
         "acme_server":          acme_server or "letsencrypt",
         "dns_provider":         provider,
         "dns_credentials":      {k: f.get(k, "") for k in cred_keys},
-        "cert_types": [t for t in ("ecc", "rsa")
-                       if f.get(f"issue_{t}") == "true"] or ["ecc", "rsa"],
+        "cert_types": [t for t in ("https_ecc", "https_rsa", "radius", "radsec")
+                 if f.get(f"issue_{t}") == "true"] or ["https_ecc", "https_rsa", "radius", "radsec"],
     }
 
 
@@ -771,7 +901,9 @@ def _default_server_from_env() -> dict:
     return {
         "id":                   None,
         "label":                "",
+        "certificate_id":       "",
         "cppm_host":            "",
+        "cppm_cluster_mode":   False,
         "cppm_client_id":       "",
         "cppm_client_secret":   "",
         "cppm_verify_ssl":      False,
@@ -779,11 +911,12 @@ def _default_server_from_env() -> dict:
         "cppm_callback_host":   "",
         "cppm_callback_port":   "8765",
         "domain":               "",
+        "san_dns":              [],
         "acme_email":           "",
         "acme_server":          "letsencrypt",
         "dns_provider":         "cloudflare",
         "dns_credentials":      {},
-        "cert_types":           ["ecc", "rsa"],
+        "cert_types":           ["https_ecc", "https_rsa", "radius", "radsec"],
     }
 
 
@@ -1291,10 +1424,17 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .mini-label{font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:0.1rem}
 .mini-exp{font-size:0.68rem;color:var(--subtle);margin-top:0.12rem}
 .mini-svc{font-size:0.62rem;color:var(--muted);background:rgba(148,163,184,.08);border-radius:3px;padding:0.05rem 0.35rem;margin-top:0.25rem;display:inline-block;border:1px solid rgba(148,163,184,.15)}
+.cert-badges{display:flex;flex-wrap:wrap;gap:0.4rem}
+.cert-badges .mini-cert{min-width:76px}
 .sched-next{font-size:1.05rem;font-weight:700;color:var(--accent);line-height:1}
 .sched-label{font-size:0.68rem;color:var(--muted);margin-top:0.15rem}
 .sched-sub{font-size:0.65rem;color:var(--subtle);margin-top:0.1rem}
-@media(max-width:900px){.overview-table th:nth-child(5),.overview-table td:nth-child(5){display:none}}
+.cluster-row td{padding:0 0.85rem 0.85rem;border-bottom:1px solid rgba(51,65,85,.4)}
+.cluster-nodes-inline{display:flex;flex-direction:column;align-items:flex-start;gap:0.4rem}
+.cluster-lbl{font-size:0.62rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--subtle)}
+.cluster-node-chip{display:flex;align-items:center;flex-wrap:wrap;gap:0.35rem;background:rgba(148,163,184,.06);border:1px solid rgba(148,163,184,.15);border-radius:0.4rem;padding:0.3rem 0.55rem}
+.cluster-node-name{font-family:monospace;font-size:0.72rem;color:var(--text)}
+.cluster-node-ip{font-weight:400;color:var(--subtle)}
 @media(max-width:700px){.overview-table th:nth-child(4),.overview-table td:nth-child(4){display:none}}
 
 /* ── Status dots (health indicators) ── */
@@ -2057,8 +2197,7 @@ def _overview_page(username: str = "") -> str:
     <thead><tr>
       <th>ClearPass Server</th>
       <th>DNS &amp; ACME Provider</th>
-      <th>ECC Certificate</th>
-      <th>RSA Certificate</th>
+      <th>Certificate Services</th>
       <th>Next Renewal Check</th>
       <th></th>
     </tr></thead>
@@ -2223,9 +2362,75 @@ def _settings_form_page(server: dict = None, error: str = "",
     acme_srv   = "custom" if acme_is_custom else acme_srv_raw
     acme_custom_url = _esc(acme_srv_raw) if acme_is_custom else ""
     verify     = " checked" if s.get("cppm_verify_ssl") else ""
-    cert_types = s.get("cert_types") or ["ecc", "rsa"]
-    chk_ecc    = " checked" if "ecc" in cert_types else ""
-    chk_rsa    = " checked" if "rsa" in cert_types else ""
+    cert_types = s.get("cert_types") or ["https_ecc", "https_rsa", "radius", "radsec"]
+    chk_https_ecc = " checked" if "https_ecc" in cert_types or "ecc" in cert_types else ""
+    chk_https_rsa = " checked" if "https_rsa" in cert_types else ""
+    chk_radius = " checked" if "radius" in cert_types or "rsa" in cert_types else ""
+    chk_radsec = " checked" if "radsec" in cert_types or "rsa" in cert_types else ""
+    san_dns = s.get("san_dns") or []
+    san_fields = "".join(
+      f'''<div class="field"><label>SAN DNS {i}</label>
+      <input type="text" name="san_dns_{i}" class="cert-shared" value="{_esc(str(san_dns[i - 1])) if len(san_dns) >= i else ""}"
+           placeholder="alt{i}.{fv('domain')}"></div>'''
+      for i in range(1, 11)
+    )
+    # Certificate Profile ID field — a dropdown of existing profiles (add mode
+    # only) lets a new server reuse another target's ACME/DNS configuration.
+    # The backend (_inherit_certificate_profile) already re-derives the shared
+    # fields from the matching profile on save regardless of what the form
+    # posts for them; the dropdown + auto-fill below is purely to make that
+    # behavior visible and to save re-typing.
+    cert_profiles_script = ""
+    if is_edit:
+        cert_profile_field_html = f'''
+      <div class="field">
+        <label>Certificate Profile ID <span class="hint">(reuse this value on other ClearPass targets)</span></label>
+        <input type="text" name="certificate_id" id="certificate_id_input" value="{fv('certificate_id')}"
+               placeholder="e.g. arubasecurity.com-prod" pattern="[A-Za-z0-9_.-]+">
+      </div>'''
+    else:
+        profiles = list_certificate_profiles()
+        profile_options = "".join(
+            f'<option value="{_esc(pid)}">{_esc(pid)} &mdash; {_esc(p.get("label") or p.get("domain") or p.get("cppm_host", ""))}</option>'
+            for p in profiles
+            for pid in [str(p.get("certificate_id", "")).strip()]
+        )
+        if profiles:
+            profiles_json = json.dumps({
+                str(p.get("certificate_id", "")).strip(): {
+                    "domain":           p.get("domain", ""),
+                    "san_dns":          p.get("san_dns") or [],
+                    "acme_email":       p.get("acme_email", ""),
+                    "acme_server":      p.get("acme_server", ""),
+                    "dns_provider":     p.get("dns_provider", ""),
+                    "dns_credentials":  p.get("dns_credentials") or {},
+                    "cert_types":       p.get("cert_types") or [],
+                }
+                for p in profiles
+            }).replace("</", "<\\/")
+            cert_profile_field_html = f'''
+      <div class="field">
+        <label>Certificate Profile <span class="hint">(share one certificate across multiple ClearPass targets)</span></label>
+        <select id="cert_profile_select" onchange="applyCertProfile(this.value)">
+          <option value="">+ Create new certificate profile</option>
+          {profile_options}
+        </select>
+      </div>
+      <div class="field">
+        <label>Certificate Profile ID</label>
+        <input type="text" name="certificate_id" id="certificate_id_input" value="{fv('certificate_id')}"
+               placeholder="e.g. arubasecurity.com-prod" pattern="[A-Za-z0-9_.-]+">
+        <div class="hint" id="cert-profile-notice" style="display:none;margin-top:0.35rem;color:var(--accent)"></div>
+      </div>'''
+            cert_profiles_script = f'<script>window.CERT_PROFILES = {profiles_json};</script>'
+        else:
+            cert_profile_field_html = f'''
+      <div class="field">
+        <label>Certificate Profile ID <span class="hint">(reuse this value on other ClearPass targets)</span></label>
+        <input type="text" name="certificate_id" id="certificate_id_input" value="{fv('certificate_id')}"
+               placeholder="e.g. arubasecurity.com-prod" pattern="[A-Za-z0-9_.-]+">
+      </div>'''
+
     # Form body — f-string with all interpolated Python values.
     # JavaScript is in a separate raw string appended below (no {{ }} issues).
     form = f"""
@@ -2244,6 +2449,7 @@ def _settings_form_page(server: dict = None, error: str = "",
         <input type="text" name="label" value="{fv('label')}" required
                placeholder="e.g. Production ClearPass">
       </div>
+      {cert_profile_field_html}
     </div>
 
     <div class="card" style="margin-bottom:1rem">
@@ -2253,6 +2459,13 @@ def _settings_form_page(server: dict = None, error: str = "",
           <label>Host / IP</label>
           <input type="text" name="cppm_host" value="{fv('cppm_host')}" required
                  placeholder="cppm.example.com">
+        </div>
+        <div class="field" style="display:flex;align-items:end;padding-bottom:0.5rem">
+          <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+            <input type="checkbox" name="cppm_cluster_mode" value="true"{(' checked' if s.get('cppm_cluster_mode') else '')}
+                   style="width:auto;margin:0">
+            Cluster mode <span class="hint">— upload to all ClearPass nodes</span>
+          </label>
         </div>
         <div class="field">
           <label>Client ID</label>
@@ -2299,18 +2512,21 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="form-2col">
         <div class="field">
           <label>Domain</label>
-          <input type="text" name="domain" value="{fv('domain')}" required
+             <input type="text" name="domain" id="domain" class="cert-shared" value="{fv('domain')}"
                  placeholder="cppm.example.com">
         </div>
         <div class="field">
           <label>ACME Email</label>
-          <input type="email" name="acme_email" value="{fv('acme_email')}" required
+             <input type="email" name="acme_email" id="acme_email" class="cert-shared" value="{fv('acme_email')}"
                  placeholder="admin@example.com">
         </div>
       </div>
+      <div class="form-section-title" style="margin-top:1rem">Subject Alternative Names (optional)</div>
+      <p class="hint" style="margin:0 0 0.75rem">Add up to 10 additional DNS names to this certificate.</p>
+      <div class="form-2col">{san_fields}</div>
       <div class="field">
         <label>Certificate Authority</label>
-        <select name="acme_server" id="acme_server" onchange="switchAcme(this.value)">
+        <select name="acme_server" id="acme_server" class="cert-shared" onchange="switchAcme(this.value)">
           <option value="letsencrypt"{sel(acme_srv,'letsencrypt')}>Let&apos;s Encrypt</option>
           <option value="letsencrypt_test"{sel(acme_srv,'letsencrypt_test')}>Let&apos;s Encrypt (Staging)</option>
           <option value="zerossl"{sel(acme_srv,'zerossl')}>ZeroSSL</option>
@@ -2318,6 +2534,21 @@ def _settings_form_page(server: dict = None, error: str = "",
           <option value="buypass_test"{sel(acme_srv,'buypass_test')}>Buypass (Staging)</option>
           <option value="custom"{sel(acme_srv,'custom')}>Custom / Private CA</option>
         </select>
+      </div>
+      <div id="acme-eab-section" style="{'display:none' if acme_srv != 'zerossl' else ''}">
+        <div class="flash flash-warn" style="margin-bottom:0.75rem">
+          ZeroSSL requires External Account Binding credentials. Get the KID and HMAC key from your ZeroSSL account.
+        </div>
+        <div class="form-2col">
+          <div class="field">
+            <label>EAB KID</label>
+            <input type="text" name="EAB_KID" id="EAB_KID" class="cert-shared" value="{cv('EAB_KID')}" autocomplete="off">
+          </div>
+          <div class="field">
+            <label>EAB HMAC Key</label>
+            <input type="password" name="EAB_HMAC_KEY" id="EAB_HMAC_KEY" class="cert-shared" value="{cv('EAB_HMAC_KEY')}" autocomplete="new-password">
+          </div>
+        </div>
       </div>
       <div id="acme-custom-section" style="{'display:none' if acme_srv != 'custom' else ''}">
         <div class="flash flash-warn" style="margin-bottom:0.75rem">
@@ -2328,7 +2559,7 @@ def _settings_form_page(server: dict = None, error: str = "",
         </div>
         <div class="field" style="margin-bottom:0">
           <label>ACME Directory URL</label>
-          <input type="url" name="acme_server_url" id="acme_server_url"
+          <input type="url" name="acme_server_url" id="acme_server_url" class="cert-shared"
                  value="{acme_custom_url}"
                  placeholder="https://ca.corp.local/acme/acme/directory"
                  autocomplete="off">
@@ -2337,14 +2568,24 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="field" style="margin-bottom:0">
         <label>Certificate Types</label>
         <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
-          <input type="checkbox" name="issue_ecc" value="true"{chk_ecc}
+             <input type="checkbox" name="issue_https_ecc" class="cert-shared" value="true"{chk_https_ecc}
                  style="width:auto;margin:0">
-          ECC <span class="hint">— HTTPS / Web Interface</span>
+             HTTPS (ECC) <span class="hint">— Web UI and API</span>
         </label>
         <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
-          <input type="checkbox" name="issue_rsa" value="true"{chk_rsa}
+             <input type="checkbox" name="issue_https_rsa" class="cert-shared" value="true"{chk_https_rsa}
                  style="width:auto;margin:0">
-          RSA <span class="hint">— RADIUS / 802.1x</span>
+             HTTPS (RSA) <span class="hint">— Web UI and API</span>
+           </label>
+           <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
+             <input type="checkbox" name="issue_radius" class="cert-shared" value="true"{chk_radius}
+               style="width:auto;margin:0">
+             RADIUS <span class="hint">— 802.1X / EAP</span>
+           </label>
+           <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
+             <input type="checkbox" name="issue_radsec" class="cert-shared" value="true"{chk_radsec}
+               style="width:auto;margin:0">
+             RadSec <span class="hint">— RADIUS over TLS</span>
         </label>
       </div>
     </div>
@@ -2353,7 +2594,7 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="form-section-title">DNS Provider</div>
       <div class="field">
         <label>Provider</label>
-        <select name="dns_provider" id="dns_provider" onchange="switchDns(this.value)">
+        <select name="dns_provider" id="dns_provider" class="cert-shared" onchange="switchDns(this.value)">
           <option value="cloudflare"{sel(s.get('dns_provider','cloudflare'),'cloudflare')}>Cloudflare</option>
           <option value="porkbun"{sel(s.get('dns_provider',''),'porkbun')}>Porkbun</option>
           <option value="route53"{sel(s.get('dns_provider',''),'route53')}>AWS Route 53</option>
@@ -2368,30 +2609,30 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>API Token <span class="hint">(Zone DNS, scoped — recommended)</span></label>
-            <input type="password" name="CF_Token" value="{cv('CF_Token')}"
+            <input type="password" name="CF_Token" class="cert-shared" value="{cv('CF_Token')}"
                    autocomplete="new-password">
           </div>
           <div class="field">
             <label>Zone ID</label>
-            <input type="text" name="CF_Zone_ID" value="{cv('CF_Zone_ID')}"
+            <input type="text" name="CF_Zone_ID" class="cert-shared" value="{cv('CF_Zone_ID')}"
                    autocomplete="off">
           </div>
         </div>
         <div class="form-2col">
           <div class="field">
             <label>Account ID <span class="hint">(optional with token)</span></label>
-            <input type="text" name="CF_Account_ID" value="{cv('CF_Account_ID')}"
+            <input type="text" name="CF_Account_ID" class="cert-shared" value="{cv('CF_Account_ID')}"
                    autocomplete="off">
           </div>
           <div class="field" style="opacity:0.65">
             <label>Global API Key <span class="hint">(alternative to token)</span></label>
-            <input type="password" name="CF_Key" value="{cv('CF_Key')}"
+            <input type="password" name="CF_Key" class="cert-shared" value="{cv('CF_Key')}"
                    autocomplete="new-password">
           </div>
         </div>
         <div class="field" style="opacity:0.65;margin-bottom:0">
           <label>Account Email <span class="hint">(required with global key only)</span></label>
-          <input type="email" name="CF_Email" value="{cv('CF_Email')}"
+          <input type="email" name="CF_Email" class="cert-shared" value="{cv('CF_Email')}"
                  autocomplete="off">
         </div>
       </div>
@@ -2400,12 +2641,12 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>API Key</label>
-            <input type="password" name="PORKBUN_API_KEY" value="{cv('PORKBUN_API_KEY')}"
+            <input type="password" name="PORKBUN_API_KEY" class="cert-shared" value="{cv('PORKBUN_API_KEY')}"
                    autocomplete="new-password">
           </div>
           <div class="field">
             <label>Secret API Key</label>
-            <input type="password" name="PORKBUN_SECRET_API_KEY"
+            <input type="password" name="PORKBUN_SECRET_API_KEY" class="cert-shared"
                    value="{cv('PORKBUN_SECRET_API_KEY')}" autocomplete="new-password">
           </div>
         </div>
@@ -2415,18 +2656,18 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>Access Key ID</label>
-            <input type="text" name="AWS_ACCESS_KEY_ID" value="{cv('AWS_ACCESS_KEY_ID')}"
+            <input type="text" name="AWS_ACCESS_KEY_ID" class="cert-shared" value="{cv('AWS_ACCESS_KEY_ID')}"
                    autocomplete="off">
           </div>
           <div class="field">
             <label>Secret Access Key</label>
-            <input type="password" name="AWS_SECRET_ACCESS_KEY"
+            <input type="password" name="AWS_SECRET_ACCESS_KEY" class="cert-shared"
                    value="{cv('AWS_SECRET_ACCESS_KEY')}" autocomplete="new-password">
           </div>
         </div>
         <div class="field" style="margin-bottom:0">
           <label>Region</label>
-          <input type="text" name="AWS_DEFAULT_REGION"
+          <input type="text" name="AWS_DEFAULT_REGION" class="cert-shared"
                  value="{cv('AWS_DEFAULT_REGION', 'us-east-1')}" autocomplete="off">
         </div>
       </div>
@@ -2434,7 +2675,7 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div id="dns-digitalocean" class="dns-section"{vis('digitalocean')}>
         <div class="field" style="margin-bottom:0">
           <label>API Token</label>
-          <input type="password" name="DO_API_KEY" value="{cv('DO_API_KEY')}"
+          <input type="password" name="DO_API_KEY" class="cert-shared" value="{cv('DO_API_KEY')}"
                  autocomplete="new-password">
         </div>
       </div>
@@ -2443,11 +2684,11 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>API Key</label>
-            <input type="text" name="GD_Key" value="{cv('GD_Key')}" autocomplete="off">
+            <input type="text" name="GD_Key" class="cert-shared" value="{cv('GD_Key')}" autocomplete="off">
           </div>
           <div class="field">
             <label>API Secret</label>
-            <input type="password" name="GD_Secret" value="{cv('GD_Secret')}"
+            <input type="password" name="GD_Secret" class="cert-shared" value="{cv('GD_Secret')}"
                    autocomplete="new-password">
           </div>
         </div>
@@ -2457,36 +2698,36 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>Grid Master Host <span class="hint">(hostname or IP)</span></label>
-            <input type="text" name="INFOBLOX_HOST" value="{cv('INFOBLOX_HOST')}"
+            <input type="text" name="INFOBLOX_HOST" class="cert-shared" value="{cv('INFOBLOX_HOST')}"
                    autocomplete="off">
           </div>
           <div class="field">
             <label>Username</label>
-            <input type="text" name="INFOBLOX_USERNAME" value="{cv('INFOBLOX_USERNAME')}"
+            <input type="text" name="INFOBLOX_USERNAME" class="cert-shared" value="{cv('INFOBLOX_USERNAME')}"
                    autocomplete="off">
           </div>
         </div>
         <div class="form-2col">
           <div class="field">
             <label>Password</label>
-            <input type="password" name="INFOBLOX_PASSWORD" value="{cv('INFOBLOX_PASSWORD')}"
+            <input type="password" name="INFOBLOX_PASSWORD" class="cert-shared" value="{cv('INFOBLOX_PASSWORD')}"
                    autocomplete="new-password">
           </div>
           <div class="field">
             <label>DNS View <span class="hint">(default: default)</span></label>
-            <input type="text" name="INFOBLOX_VIEW" value="{cv('INFOBLOX_VIEW', 'default')}"
+            <input type="text" name="INFOBLOX_VIEW" class="cert-shared" value="{cv('INFOBLOX_VIEW', 'default')}"
                    autocomplete="off">
           </div>
         </div>
         <div class="form-2col" style="margin-bottom:0">
           <div class="field">
             <label>WAPI Version <span class="hint">(default: 2.5)</span></label>
-            <input type="text" name="INFOBLOX_WAPI_VERSION"
+            <input type="text" name="INFOBLOX_WAPI_VERSION" class="cert-shared"
                    value="{cv('INFOBLOX_WAPI_VERSION', '2.5')}" autocomplete="off">
           </div>
           <div class="field">
             <label>SSL Verify <span class="hint">(true/false)</span></label>
-            <input type="text" name="INFOBLOX_SSL_VERIFY"
+            <input type="text" name="INFOBLOX_SSL_VERIFY" class="cert-shared"
                    value="{cv('INFOBLOX_SSL_VERIFY', 'true')}" autocomplete="off">
           </div>
         </div>
@@ -2496,30 +2737,30 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>Nameserver <span class="hint">(host or host:port)</span></label>
-            <input type="text" name="RFC2136_NAMESERVER" value="{cv('RFC2136_NAMESERVER')}"
+            <input type="text" name="RFC2136_NAMESERVER" class="cert-shared" value="{cv('RFC2136_NAMESERVER')}"
                    autocomplete="off">
           </div>
           <div class="field">
             <label>TSIG Key Name <span class="hint">(leave blank for unsigned updates)</span></label>
-            <input type="text" name="RFC2136_TSIG_KEY" value="{cv('RFC2136_TSIG_KEY')}"
+            <input type="text" name="RFC2136_TSIG_KEY" class="cert-shared" value="{cv('RFC2136_TSIG_KEY')}"
                    autocomplete="off">
           </div>
         </div>
         <div class="form-2col">
           <div class="field">
             <label>TSIG Secret</label>
-            <input type="password" name="RFC2136_TSIG_SECRET"
+            <input type="password" name="RFC2136_TSIG_SECRET" class="cert-shared"
                    value="{cv('RFC2136_TSIG_SECRET')}" autocomplete="new-password">
           </div>
           <div class="field">
             <label>TSIG Algorithm <span class="hint">(default: hmac-md5)</span></label>
-            <input type="text" name="RFC2136_TSIG_ALGORITHM"
+            <input type="text" name="RFC2136_TSIG_ALGORITHM" class="cert-shared"
                    value="{cv('RFC2136_TSIG_ALGORITHM', 'hmac-md5')}" autocomplete="off">
           </div>
         </div>
         <div class="field" style="margin-bottom:0">
           <label>DNS Timeout <span class="hint">(seconds, default: 10)</span></label>
-          <input type="text" name="RFC2136_DNS_TIMEOUT"
+          <input type="text" name="RFC2136_DNS_TIMEOUT" class="cert-shared"
                  value="{cv('RFC2136_DNS_TIMEOUT', '10')}" autocomplete="off">
         </div>
       </div>
@@ -2547,9 +2788,80 @@ function switchDns(val) {
 function switchAcme(val) {
   var sec = document.getElementById('acme-custom-section');
   var urlInput = document.getElementById('acme_server_url');
+  var eabSec = document.getElementById('acme-eab-section');
   var isCustom = val === 'custom';
   sec.style.display = isCustom ? '' : 'none';
   urlInput.required = isCustom;
+  eabSec.style.display = val === 'zerossl' ? '' : 'none';
+}
+function setSharedFieldsDisabled(disabled) {
+  document.querySelectorAll('.cert-shared').forEach(function(el) { el.disabled = disabled; });
+}
+function applyCertProfile(value) {
+  var idInput = document.getElementById('certificate_id_input');
+  var notice  = document.getElementById('cert-profile-notice');
+  if (!value) {
+    idInput.readOnly = false;
+    idInput.value = '';
+    ['domain', 'acme_email', 'EAB_KID', 'EAB_HMAC_KEY'].forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    for (var i = 1; i <= 10; i++) {
+      var san = document.querySelector('[name="san_dns_' + i + '"]');
+      if (san) san.value = '';
+    }
+    document.querySelectorAll('.dns-section input').forEach(function(el) { el.value = ''; });
+    document.getElementById('acme_server_url').value = '';
+    ['issue_https_ecc', 'issue_https_rsa', 'issue_radius', 'issue_radsec'].forEach(function(name) {
+      var el = document.querySelector('[name="' + name + '"]');
+      if (el) el.checked = true;
+    });
+    setSharedFieldsDisabled(false);
+    switchDns(document.getElementById('dns_provider').value);
+    switchAcme(document.getElementById('acme_server').value);
+    if (notice) notice.style.display = 'none';
+    return;
+  }
+  var p = (window.CERT_PROFILES || {})[value];
+  if (!p) return;
+  idInput.value = value;
+  idInput.readOnly = true;
+  document.getElementById('domain').value = p.domain || '';
+  document.getElementById('acme_email').value = p.acme_email || '';
+  for (var j = 1; j <= 10; j++) {
+    var sanEl = document.querySelector('[name="san_dns_' + j + '"]');
+    if (sanEl) sanEl.value = (p.san_dns && p.san_dns[j - 1]) || '';
+  }
+  var rawAcme = p.acme_server || 'letsencrypt';
+  var acmeSel = rawAcme.indexOf('http') === 0 ? 'custom' : rawAcme;
+  document.getElementById('acme_server').value = acmeSel;
+  document.getElementById('acme_server_url').value = acmeSel === 'custom' ? rawAcme : '';
+  var creds = p.dns_credentials || {};
+  document.getElementById('EAB_KID').value = creds.EAB_KID || '';
+  document.getElementById('EAB_HMAC_KEY').value = creds.EAB_HMAC_KEY || '';
+  var dnsProv = p.dns_provider || 'cloudflare';
+  document.getElementById('dns_provider').value = dnsProv;
+  document.querySelectorAll('.dns-section input').forEach(function(el) { el.value = ''; });
+  Object.keys(creds).forEach(function(k) {
+    if (k === 'EAB_KID' || k === 'EAB_HMAC_KEY') return;
+    var el = document.querySelector('.dns-section [name="' + k + '"]');
+    if (el) el.value = creds[k];
+  });
+  var types = (p.cert_types || []).slice();
+  if (types.indexOf('ecc') !== -1) types.push('https_ecc');
+  if (types.indexOf('rsa') !== -1) { types.push('radius'); types.push('radsec'); }
+  ['https_ecc', 'https_rsa', 'radius', 'radsec'].forEach(function(t) {
+    var el = document.querySelector('[name="issue_' + t + '"]');
+    if (el) el.checked = types.indexOf(t) !== -1;
+  });
+  switchDns(dnsProv);
+  switchAcme(acmeSel);
+  setSharedFieldsDisabled(true);
+  if (notice) {
+    notice.style.display = '';
+    notice.textContent = 'Populated from certificate profile "' + value + '". These fields are shared by every server on this profile — edit a server already on the profile to change them.';
+  }
 }
 (function() {
   switchDns(document.getElementById('dns_provider').value);
@@ -2557,7 +2869,7 @@ function switchAcme(val) {
 })();
 </script>"""
 
-    return _base(title, form + script,
+    return _base(title, form + cert_profiles_script + script,
                  nav_user=username, active="settings", show_nav=True)
 
 
@@ -2619,9 +2931,50 @@ def _sched_cell(sc: dict) -> str:
             f'<div class="sched-sub">{_esc(sc.get("schedule", "—"))}</div>')
 
 
+def _service_badge(name: str, status: str) -> str:
+    cls = "badge-ok" if status == "installed" else "badge-none"
+    return f'<span class="badge {cls}">{_esc(name)} &middot; {_esc(status)}</span>'
+
+
+_OVERVIEW_COLSPAN = 5
+
+
+def _cluster_overview_row(s: dict) -> str:
+    """Inline cluster-node breakdown shown directly under a cluster-mode server's row."""
+    if not s.get("cluster_mode"):
+        return ""
+    nodes = s.get("cluster_nodes") or []
+    if not nodes:
+        body = '<span style="font-size:0.72rem;color:var(--subtle)">No cluster nodes discovered.</span>'
+    else:
+        chips = []
+        for node in nodes:
+            name = _esc(node.get("host") or "Unknown node")
+            addr = str(node.get("address") or "").strip()
+            label = (f'{name} <span class="cluster-node-ip">{_esc(addr)}</span>'
+                     if addr and addr != node.get("host") else name)
+            if node.get("error"):
+                chips.append(
+                    f'<div class="cluster-node-chip"><span class="cluster-node-name">{label}</span>'
+                    f'<span class="badge badge-danger">{_esc(node["error"])}</span></div>'
+                )
+                continue
+            services = node.get("services") or []
+            if services:
+                badges = "".join(_service_badge(sv.get("service_name", ""), sv.get("status", ""))
+                                  for sv in services)
+            else:
+                badges = '<span style="font-size:0.7rem;color:var(--subtle)">No certificate service data</span>'
+            chips.append(f'<div class="cluster-node-chip"><span class="cluster-node-name">{label}</span>{badges}</div>')
+        body = "".join(chips)
+    return (f'<tr class="cluster-row"><td colspan="{_OVERVIEW_COLSPAN}">'
+            f'<div class="cluster-nodes-inline"><span class="cluster-lbl">Cluster nodes</span>{body}</div>'
+            f'</td></tr>')
+
+
 def _overview_rows(servers: list) -> str:
     if not servers:
-        return ('<tr><td colspan="6"><div class="empty">No servers configured. '
+        return (f'<tr><td colspan="{_OVERVIEW_COLSPAN}"><div class="empty">No servers configured. '
                 '<a href="/settings/add" style="color:var(--accent)">Add a server</a>.'
                 '</div></td></tr>')
     rows = []
@@ -2644,6 +2997,12 @@ def _overview_rows(servers: list) -> str:
                 f'<span style="color:var(--border2);margin:0 0.15rem">·</span>'
                 f'{_dot("cb")}<span style="font-size:0.68rem;color:var(--subtle)">Callback</span>'
                 f'</div>')
+        cert_badges = (
+            f'{_mini_cert(ecc, "HTTPS(ECC)")}'
+            f'{_mini_cert(rsa, "HTTPS(RSA)")}'
+            f'{_mini_cert(rsa, "RadSec")}'
+            f'{_mini_cert(rsa, "RADIUS")}'
+        )
         rows.append(
             f'<tr class="server-row" onclick="window.location.href=\'/server/{sid}\'">'
             f'<td>'
@@ -2654,13 +3013,13 @@ def _overview_rows(servers: list) -> str:
             f'{dns}'
             f'<div style="font-size:0.65rem;color:var(--subtle);margin-top:0.18rem">{acme}</div>'
             f'</td>'
-            f'<td>{_mini_cert(ecc, "ECC", "HTTPS · Web Interface")}</td>'
-            f'<td>{_mini_cert(rsa, "RSA", "RADIUS · 802.1X")}</td>'
+            f'<td><div class="cert-badges">{cert_badges}</div></td>'
             f'<td>{_sched_cell(s.get("schedule", {}))}</td>'
             f'<td style="text-align:right">'
             f'<a href="/server/{sid}" class="btn btn-ghost" onclick="event.stopPropagation()">Details &#8594;</a>'
             f'</td></tr>'
         )
+        rows.append(_cluster_overview_row(s))
     return "".join(rows)
 
 
@@ -3016,11 +3375,35 @@ function fmtDate(iso){if(!iso)return'—';try{return new Date(iso).toLocaleDateS
 function dnsLabel(p){var m={cloudflare:'Cloudflare',porkbun:'Porkbun',route53:'AWS Route 53',digitalocean:'DigitalOcean',godaddy:'GoDaddy',infoblox:'Infoblox',rfc2136:'RFC 2136'};return m[p]||p||'—';}
 function acmeLabel(s){var m={letsencrypt:"Let's Encrypt",letsencrypt_test:"Let's Encrypt (Staging)",zerossl:'ZeroSSL',buypass:'Buypass',buypass_test:'Buypass (Staging)'};return m[s]||(s&&s.startsWith('http')?'Custom CA':s)||'—';}
 
-function renderMiniCert(cert,label,svc){
-  var svcHtml=svc?'<div class="mini-svc">'+esc(svc)+'</div>':'';
-  if(!cert||!cert.exists){return'<div class="mini-cert none"><div class="mini-days none">—</div><div class="mini-label">'+esc(label)+'</div><div class="mini-exp">Not found</div>'+svcHtml+'</div>';}
+function renderMiniCert(cert,label){
+  if(!cert||!cert.exists){return'<div class="mini-cert none"><div class="mini-days none">—</div><div class="mini-label">'+esc(label)+'</div><div class="mini-exp">Not found</div></div>';}
   var d=cert.days_left,c=cls(d);
-  return'<div class="mini-cert '+c+'"><div class="mini-days '+c+'">'+(d!=null?d:'—')+'</div><div class="mini-label">days &middot; '+esc(label)+'</div><div class="mini-exp">'+esc(fmtDate(cert.not_after))+'</div>'+svcHtml+'</div>';
+  return'<div class="mini-cert '+c+'"><div class="mini-days '+c+'">'+(d!=null?d:'—')+'</div><div class="mini-label">days &middot; '+esc(label)+'</div><div class="mini-exp">'+esc(fmtDate(cert.not_after))+'</div></div>';
+}
+function svcBadge(name,status){
+  var c=status==='installed'?'badge-ok':'badge-none';
+  return'<span class="badge '+c+'">'+esc(name)+' &middot; '+esc(status)+'</span>';
+}
+function renderClusterRow(s){
+  if(!s.cluster_mode)return'';
+  var nodes=s.cluster_nodes||[];
+  var body;
+  if(!nodes.length){
+    body='<span style="font-size:0.72rem;color:var(--subtle)">No cluster nodes discovered.</span>';
+  }else{
+    body=nodes.map(function(node){
+      var name=esc(node.host||'Unknown node');
+      var addr=(node.address||'').trim();
+      var label=(addr&&addr!==node.host)?name+' <span class="cluster-node-ip">'+esc(addr)+'</span>':name;
+      if(node.error){
+        return'<div class="cluster-node-chip"><span class="cluster-node-name">'+label+'</span><span class="badge badge-danger">'+esc(node.error)+'</span></div>';
+      }
+      var services=node.services||[];
+      var badges=services.length?services.map(function(sv){return svcBadge(sv.service_name,sv.status);}).join(''):'<span style="font-size:0.7rem;color:var(--subtle)">No certificate service data</span>';
+      return'<div class="cluster-node-chip"><span class="cluster-node-name">'+label+'</span>'+badges+'</div>';
+    }).join('');
+  }
+  return'<tr class="cluster-row"><td colspan="5"><div class="cluster-nodes-inline"><span class="cluster-lbl">Cluster nodes</span>'+body+'</div></td></tr>';
 }
 function renderSched(sc){sc=sc||{};return'<div class="sched-next">'+esc(sc.until||'—')+'</div><div class="sched-label">until next check</div><div class="sched-sub">'+esc(sc.schedule||'—')+'</div>';}
 function ovDot(sid,kind){
@@ -3044,15 +3427,17 @@ function renderRow(s){
   var sid=s.id||'';
   var ecc=(s.certs&&s.certs.ecc)||{exists:false};
   var rsa=(s.certs&&s.certs.rsa)||{exists:false};
+  var certBadges=renderMiniCert(ecc,'HTTPS(ECC)')+renderMiniCert(rsa,'HTTPS(RSA)')+renderMiniCert(rsa,'RadSec')+renderMiniCert(rsa,'RADIUS');
   return'<tr class="server-row" data-sid="'+esc(sid)+'" onclick="nav(this)">'
     +'<td><div class="srv-label">'+esc(s.label||s.cppm_host)+'</div>'
     +'<div class="srv-host">'+esc(s.cppm_host)+'</div>'
     +renderDots(sid)+'</td>'
     +'<td>'+esc(dnsLabel(s.dns_provider))
     +'<div style="font-size:0.65rem;color:var(--subtle);margin-top:0.18rem">'+esc(acmeLabel(s.acme_server))+'</div></td>'
-    +'<td>'+renderMiniCert(ecc,'ECC','HTTPS \xb7 Web Interface')+'</td><td>'+renderMiniCert(rsa,'RSA','RADIUS \xb7 802.1X')+'</td>'
+    +'<td><div class="cert-badges">'+certBadges+'</div></td>'
     +'<td>'+renderSched(s.schedule)+'</td>'
-    +'<td style="text-align:right"><a href="/server/'+esc(sid)+'" class="btn btn-ghost" onclick="event.stopPropagation()">Details &#8594;</a></td></tr>';
+    +'<td style="text-align:right"><a href="/server/'+esc(sid)+'" class="btn btn-ghost" onclick="event.stopPropagation()">Details &#8594;</a></td></tr>'
+    +renderClusterRow(s);
 }
 
 function applyDot(el,h){var s=h.status||'unknown',m=h.message||'';el.className='sdot '+s;var tip=m?(s+': '+m):s;el.title=tip;el.dataset.tooltip=tip;}
@@ -3148,6 +3533,7 @@ _DETAIL_BODY = """
 </div>
 
 <div class="grid-2" id="cert-cards"></div>
+<div id="cluster-cards"></div>
 <div class="grid-2" id="info-cards"></div>
 
 <div class="log-card">
@@ -3207,7 +3593,7 @@ _DETAIL_SCRIPT = """
 // SERVER_ID is injected as a <script> block immediately before this file
 var REFRESH_MS = 30000;
 var HEALTH_MS  = 300000;
-var _certData  = {ecc: null, rsa: null};
+var _certData  = {ecc: null, rsa: null, https_ecc: null, https_rsa: null, radius: null, radsec: null};
 var _statusData = null;
 var _healthData = {};
 var _SERVER_ID  = (typeof SERVER_ID !== 'undefined') ? SERVER_ID : 'env';
@@ -3269,6 +3655,18 @@ function renderInfoCards(data, health){
   return sched+cfg;
 }
 
+function renderClusterNodes(data){
+  if(!data.cluster_mode)return'';
+  var nodes=data.cluster_nodes||[];
+  if(!nodes.length)return'<div class="card"><div class="card-title">Cluster Nodes</div><div class="empty">No cluster nodes discovered.</div></div>';
+  return'<div class="card" style="margin-bottom:1rem"><div class="card-title">ClearPass Cluster Nodes</div>'
+    +nodes.map(function(node){
+      var services=(node.services||[]).map(function(s){return'<span class="badge badge-ok" style="margin:0 .3rem .3rem 0">'+esc(s.service_name)+' · '+esc(s.status)+'</span>';}).join('');
+      return'<div class="row" style="display:block;padding:.65rem 0;border-bottom:1px solid var(--border)"><strong>'+esc(node.host||'Unknown node')+'</strong>'
+        +(node.error?'<div class="hint">'+esc(node.error)+'</div>':(services||'<div class="hint">No certificate service data</div>'))+'</div>';
+    }).join('')+'</div>';
+}
+
 function renderLog(activity){
   if(!activity||!activity.length)return'<tr><td colspan="4"><div class="empty">No activity recorded yet.</div></td></tr>';
   return activity.map(function(e){return'<tr><td class="ts">'+esc(e.ts)+'</td><td class="lvl-cell">'+lvlBadge(e.level)+'</td><td class="cat">'+esc(e.category)+'</td><td class="msg">'+esc(e.message)+'</td></tr>';}).join('');
@@ -3281,7 +3679,12 @@ function render(data){
   var ecc=(data.certs&&data.certs.ecc)||{exists:false};
   var rsa=(data.certs&&data.certs.rsa)||{exists:false};
   _certData.ecc=ecc; _certData.rsa=rsa;
-  document.getElementById('cert-cards').innerHTML=renderCertCard(ecc,'ECC Certificate','HTTPS(ECC)','ecc')+renderCertCard(rsa,'RSA Certificate','RADIUS','rsa');
+  _certData.https_ecc=ecc; _certData.https_rsa=rsa; _certData.radius=rsa; _certData.radsec=rsa;
+  document.getElementById('cert-cards').innerHTML=renderCertCard(ecc,'HTTPS (ECC)','HTTPS(ECC)','https_ecc')
+    +renderCertCard(rsa,'HTTPS (RSA)','HTTPS(RSA)','https_rsa')
+    +renderCertCard(rsa,'RADIUS','RADIUS','radius')
+    +renderCertCard(rsa,'RadSec','RadSec','radsec');
+  document.getElementById('cluster-cards').innerHTML=renderClusterNodes(data);
   document.getElementById('info-cards').innerHTML=renderInfoCards(data,_healthData);
   document.getElementById('log-body').innerHTML=renderLog(data.activity);
   if(_activeLogTab==='activity'){
@@ -3291,7 +3694,7 @@ function render(data){
 }
 
 function showCert(key){
-  var labels={ecc:'ECC Certificate',rsa:'RSA Certificate'};
+  var labels={ecc:'ECC Certificate',rsa:'RSA Certificate',https_ecc:'HTTPS (ECC)',https_rsa:'HTTPS (RSA)',radius:'RADIUS',radsec:'RadSec'};
   showModal(_certData[key]||{exists:false},labels[key]||key);
 }
 

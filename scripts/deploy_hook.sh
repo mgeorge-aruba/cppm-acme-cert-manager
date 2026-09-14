@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # deploy_hook.sh – Called after successful issuance/renewal
-#                  Uploads ECC cert → HTTPS(ECC) and RSA cert → RADIUS
+#                  Uploads selected ECC/RSA certs to ClearPass service slots
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -36,6 +36,10 @@ fi
 
 ISSUE_ECC="${ISSUE_ECC:-true}"
 ISSUE_RSA="${ISSUE_RSA:-true}"
+UPLOAD_HTTPS_ECC="${UPLOAD_HTTPS_ECC:-$ISSUE_ECC}"
+UPLOAD_HTTPS_RSA="${UPLOAD_HTTPS_RSA:-false}"
+UPLOAD_RADIUS="${UPLOAD_RADIUS:-$ISSUE_RSA}"
+UPLOAD_RADSEC="${UPLOAD_RADSEC:-$ISSUE_RSA}"
 
 ACME_CA_LABEL="${ACME_SERVER:-letsencrypt}"
 case "$ACME_CA_LABEL" in
@@ -58,7 +62,7 @@ log "  ACME CA  : ${ACME_CA_LABEL}"
 UPLOAD_ARGS=()
 PRIMARY_CERT=""
 
-if [[ "$ISSUE_ECC" == "true" ]]; then
+if [[ "$UPLOAD_HTTPS_ECC" == "true" ]]; then
     HTTPS_CERT="${CERT_DIR}/${DOMAIN}.ecc.cer"
     HTTPS_KEY="${CERT_DIR}/${DOMAIN}.ecc.key"
     HTTPS_FULLCHAIN="${CERT_DIR}/${DOMAIN}.ecc.fullchain.cer"
@@ -66,15 +70,15 @@ if [[ "$ISSUE_ECC" == "true" ]]; then
     for f in "$HTTPS_CERT" "$HTTPS_KEY" "$HTTPS_FULLCHAIN"; do
         [[ -f "$f" ]] || { err "Required file not found: $f"; status_write "FAILED" "UPLOAD" "Cert file missing – ${f}"; exit 1; }
     done
-    UPLOAD_ARGS+=(--https-cert "$HTTPS_CERT" --https-key "$HTTPS_KEY" \
+    UPLOAD_ARGS+=(--https-ecc-cert "$HTTPS_CERT" --https-ecc-key "$HTTPS_KEY" \
                   --https-fullchain "$HTTPS_FULLCHAIN" --https-ca "$HTTPS_CA")
     PRIMARY_CERT="$HTTPS_CERT"
     log "  HTTPS (ECC): ${HTTPS_CERT}"
 else
-    UPLOAD_ARGS+=(--skip-https)
+    UPLOAD_ARGS+=(--skip-https-ecc)
 fi
 
-if [[ "$ISSUE_RSA" == "true" ]]; then
+if [[ "$UPLOAD_HTTPS_RSA" == "true" || "$UPLOAD_RADIUS" == "true" || "$UPLOAD_RADSEC" == "true" ]]; then
     RADIUS_CERT="${CERT_DIR}/${DOMAIN}.rsa.cer"
     RADIUS_KEY="${CERT_DIR}/${DOMAIN}.rsa.key"
     RADIUS_FULLCHAIN="${CERT_DIR}/${DOMAIN}.rsa.fullchain.cer"
@@ -82,12 +86,28 @@ if [[ "$ISSUE_RSA" == "true" ]]; then
     for f in "$RADIUS_CERT" "$RADIUS_KEY" "$RADIUS_FULLCHAIN"; do
         [[ -f "$f" ]] || { err "Required file not found: $f"; status_write "FAILED" "UPLOAD" "Cert file missing – ${f}"; exit 1; }
     done
-    UPLOAD_ARGS+=(--radius-cert "$RADIUS_CERT" --radius-key "$RADIUS_KEY" \
-                  --radius-fullchain "$RADIUS_FULLCHAIN" --radius-ca "$RADIUS_CA")
+    if [[ "$UPLOAD_HTTPS_RSA" == "true" ]]; then
+        UPLOAD_ARGS+=(--https-rsa-cert "$RADIUS_CERT" --https-rsa-key "$RADIUS_KEY" \
+                      --https-rsa-fullchain "$RADIUS_FULLCHAIN" --https-rsa-ca "$RADIUS_CA")
+    else
+        UPLOAD_ARGS+=(--skip-https-rsa)
+    fi
+    if [[ "$UPLOAD_RADIUS" == "true" ]]; then
+        UPLOAD_ARGS+=(--radius-cert "$RADIUS_CERT" --radius-key "$RADIUS_KEY" \
+                      --radius-fullchain "$RADIUS_FULLCHAIN" --radius-ca "$RADIUS_CA")
+    else
+        UPLOAD_ARGS+=(--skip-radius)
+    fi
+    if [[ "$UPLOAD_RADSEC" == "true" ]]; then
+        UPLOAD_ARGS+=(--radsec-cert "$RADIUS_CERT" --radsec-key "$RADIUS_KEY" \
+                      --radsec-fullchain "$RADIUS_FULLCHAIN" --radsec-ca "$RADIUS_CA")
+    else
+        UPLOAD_ARGS+=(--skip-radsec)
+    fi
     [[ -z "$PRIMARY_CERT" ]] && PRIMARY_CERT="$RADIUS_CERT"
     log "  RADIUS (RSA): ${RADIUS_CERT}"
 else
-    UPLOAD_ARGS+=(--skip-radius)
+    UPLOAD_ARGS+=(--skip-https-rsa --skip-radius --skip-radsec)
 fi
 
 if [[ "${SKIP_UPLOAD:-false}" == "true" ]]; then
@@ -108,13 +128,7 @@ if [[ $UPLOAD_EXIT -eq 0 ]]; then
     log "Upload succeeded."
     EXPIRY=$(openssl x509 -enddate -noout -in "$PRIMARY_CERT" 2>/dev/null \
              | cut -d= -f2 || echo "unknown")
-    if [[ "$ISSUE_ECC" == "true" && "$ISSUE_RSA" == "true" ]]; then
-        UPLOAD_LABEL="ECC→HTTPS + RSA→RADIUS"
-    elif [[ "$ISSUE_ECC" == "true" ]]; then
-        UPLOAD_LABEL="ECC→HTTPS"
-    else
-        UPLOAD_LABEL="RSA→RADIUS"
-    fi
+    UPLOAD_LABEL="selected certificate targets"
     status_write "OK" "UPLOAD" "${UPLOAD_LABEL} uploaded to ${CPPM_HOST} via ${ACME_CA_LABEL} – expires ${EXPIRY}"
     python3 /opt/cppm/notify.py \
         --server-id "${SERVER_ID:-}" \

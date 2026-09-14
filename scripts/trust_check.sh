@@ -114,8 +114,8 @@ if output:
     # Build args based on which cert types are enabled for this server
     TRUST_ARGS=(--only-trust-check)
     [[ "${ISSUE_ECC:-true}" == "true" ]] && TRUST_ARGS+=(
-        --https-cert      "${CERT_DIR}/${DOMAIN}.ecc.cer"
-        --https-key       "${CERT_DIR}/${DOMAIN}.ecc.key"
+        --https-ecc-cert  "${CERT_DIR}/${DOMAIN}.ecc.cer"
+        --https-ecc-key   "${CERT_DIR}/${DOMAIN}.ecc.key"
         --https-fullchain "${CERT_DIR}/${DOMAIN}.ecc.fullchain.cer"
         --https-ca        "${CERT_DIR}/${DOMAIN}.ecc.ca.cer"
     )

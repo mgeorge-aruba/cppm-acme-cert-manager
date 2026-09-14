@@ -70,21 +70,43 @@ entrypoint.sh
                                                     │     │           enabled=true
                                                     │     └── update_cert_trust_list_...() (flags wrong)
                                                     │
-                                                    ├── Step 1: HTTPS(ECC) Server Certificate
-                                                    │     ├── get_cluster_server_by_uuid("publisher")
-                                                    │     │     GET /api/cluster/server/publisher
-                                                    │     ├── get_server_cert()   (find HTTPS(ECC) service_name)
-                                                    │     └── PUT /api/server-cert/name/{uuid}/HTTPS(ECC)
-                                                    │           PKCS12 served via CPPM_CALLBACK_HOST
-                                                    │
-                                                    ├── Step 2: RADIUS (RSA) Service Certificate
-                                                    │     ├── get_cluster_server_by_uuid("publisher")
+                                                    ├── Step 1: RADIUS (RSA) Service Certificate (if selected)
+                                                    │     ├── get_cluster_server_by_uuid("this")
                                                     │     ├── get_server_cert()   (find RADIUS service_name)
                                                     │     └── PUT /api/server-cert/name/{uuid}/RADIUS
                                                     │           PKCS12 served via CPPM_CALLBACK_HOST
                                                     │
-                                                    └── Step 3: get_server_cert()  (verify domain present)
+                                                    ├── Step 2: RadSec (RSA) Service Certificate (if selected)
+                                                    │     ├── get_cluster_server_by_uuid("this")
+                                                    │     ├── get_server_cert()   (find RADSEC service_name)
+                                                    │     └── PUT /api/server-cert/name/{uuid}/{RADSEC service_name}
+                                                    │           Reuses the RSA PKCS12 bundle
+                                                    │           Skipped if no dedicated RadSec slot exists
+                                                    │
+                                                    ├── Step 3: HTTPS(ECC) Server Certificate (if selected)
+                                                    │     ├── get_cluster_server_by_uuid("this")
+                                                    │     │     GET /api/cluster/server/this
+                                                    │     ├── get_server_cert()   (find HTTPS(ECC) service_name)
+                                                    │     └── PUT /api/server-cert/name/{uuid}/HTTPS(ECC)
+                                                    │           PKCS12 served via CPPM_CALLBACK_HOST
+                                                    │
+                                                    ├── Step 4: HTTPS(RSA) Server Certificate (if selected)
+                                                    │     ├── get_cluster_server_by_uuid("this")
+                                                    │     ├── get_server_cert()   (find HTTPS(RSA) service_name)
+                                                    │     └── PUT /api/server-cert/name/{uuid}/HTTPS(RSA)
+                                                    │           Reuses the RSA PKCS12 bundle
+                                                    └── Step 5: get_server_cert()  (verify domain present)
 ```
+
+The UI exposes four independent ClearPass targets: HTTPS (ECC), HTTPS (RSA),
+RADIUS, and RadSec. One ECC artifact is issued when HTTPS (ECC) is selected;
+one RSA artifact is issued when any of HTTPS (RSA), RADIUS, or RadSec is
+selected. The RSA artifact is reused for each selected RSA target. ClearPass
+versions or configurations that do not return a dedicated `RADSEC` service
+entry from `GET /api/server-cert` skip the separate RadSec upload without
+failing the overall deployment. RADIUS and RadSec uploads intentionally run
+before HTTPS uploads because replacing an HTTPS certificate can restart the
+ClearPass web service.
 
 ---
 
@@ -222,12 +244,12 @@ LAN IP that CPPM can route to.
 
 | Method | Path |
 |---|---|
-| `GET` | `/api/cluster/server/publisher` |
+| `GET` | `/api/cluster/server/this` |
 | `GET` | `/api/server-cert` |
 | `PUT` | `/api/server-cert/name/{server_uuid}/HTTPS(ECC)` |
 
-The publisher server UUID is fetched via
-`ApiLocalServerConfiguration.get_cluster_server_by_uuid(uuid="publisher")`.
+The server's own UUID is fetched via
+`ApiLocalServerConfiguration.get_cluster_server_by_uuid(uuid="this")`.
 The HTTPS(ECC) service name is confirmed from `get_server_cert()` — the
 script prefers `HTTPS(ECC)` (service_id=2) then falls back to `HTTPS(RSA)`
 (service_id=7).

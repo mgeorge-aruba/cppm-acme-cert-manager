@@ -80,6 +80,7 @@ class AcmeShProvider(AcmeProvider):
         self,
         *,
         domain: str,
+        san_domains: list[str] | None = None,
         acme_server: str,
         cert_dir: str,
         key_types: list[str],
@@ -89,10 +90,12 @@ class AcmeShProvider(AcmeProvider):
         force: bool = False,
     ) -> IssueResult:
         plugin = self._plugin(dns_provider)
+        san_domains = san_domains or []
         base_args = [
             "--issue",
             "--dns",       plugin,
             "--domain",    domain,
+            *sum((["--domain", san] for san in san_domains), []),
             "--server",    acme_server,
             "--cert-home", cert_dir,
             "--home",      _ACME_HOME,
@@ -133,6 +136,7 @@ class AcmeShProvider(AcmeProvider):
         self,
         *,
         domain: str,
+        san_domains: list[str] | None = None,
         acme_server: str,
         cert_dir: str,
         key_types: list[str],

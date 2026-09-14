@@ -184,6 +184,13 @@ def _collect_server(existing: dict = None) -> dict:
     s["acme_server"] = _prompt_choice("Certificate Authority", _ACME_SERVERS,
                                       s.get("acme_server", "letsencrypt"))
 
+    if s["acme_server"] == "zerossl":
+        print("\n  ZeroSSL External Account Binding credentials:")
+        creds["EAB_KID"] = _prompt("EAB KID", creds.get("EAB_KID", ""), required=True)
+        creds["EAB_HMAC_KEY"] = _prompt(
+            "EAB HMAC Key", creds.get("EAB_HMAC_KEY", ""), required=True, secret=True
+        )
+
     print("\n── DNS Provider ─────────────────────────────────────────────────────────")
     s["dns_provider"] = _prompt_choice("Provider", _DNS_PROVIDERS,
                                        s.get("dns_provider", "cloudflare"))

@@ -68,6 +68,7 @@ esac
 
 log "=== Certificate Issuance (${CERT_LABEL}) ==="
 log "  Domain   : ${DOMAIN:-NOT SET}"
+[[ -n "${SAN_DNS:-}" ]] && log "  SAN DNS  : ${SAN_DNS//|/, }"
 log "  CPPM     : ${CPPM_HOST:-NOT SET}"
 log "  DNS      : ${DNS_PROVIDER:-NOT SET}"
 log "  ACME CA  : ${ACME_CA_LABEL}"
