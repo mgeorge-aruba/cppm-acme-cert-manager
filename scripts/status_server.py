@@ -739,9 +739,16 @@ def _check_expiry_warnings() -> None:
         except Exception:
             continue
 
-        days  = None
-        certs = status.get("certs") or {}
-        for cert_key in ("ecc", "rsa"):
+        days    = None
+        certs   = status.get("certs") or {}
+        targets = set(status.get("targets") or ["https_ecc", "https_rsa", "radius", "radsec"])
+        cert_type_map = [
+            ("ecc", {"https_ecc"}),
+            ("rsa", {"https_rsa", "radius", "radsec"}),
+        ]
+        for cert_key, cert_targets in cert_type_map:
+            if not (targets & cert_targets):
+                continue  # cert type disabled in settings
             c = certs.get(cert_key) or {}
             if c.get("exists") and c.get("days_left") is not None:
                 d = c["days_left"]
@@ -3680,10 +3687,13 @@ function render(data){
   var rsa=(data.certs&&data.certs.rsa)||{exists:false};
   _certData.ecc=ecc; _certData.rsa=rsa;
   _certData.https_ecc=ecc; _certData.https_rsa=rsa; _certData.radius=rsa; _certData.radsec=rsa;
-  document.getElementById('cert-cards').innerHTML=renderCertCard(ecc,'HTTPS (ECC)','HTTPS(ECC)','https_ecc')
-    +renderCertCard(rsa,'HTTPS (RSA)','HTTPS(RSA)','https_rsa')
-    +renderCertCard(rsa,'RADIUS','RADIUS','radius')
-    +renderCertCard(rsa,'RadSec','RadSec','radsec');
+  var targets=data.targets||['https_ecc','https_rsa','radius','radsec'];
+  var certCards='';
+  if(targets.indexOf('https_ecc')>=0) certCards+=renderCertCard(ecc,'HTTPS (ECC)','HTTPS(ECC)','https_ecc');
+  if(targets.indexOf('https_rsa')>=0) certCards+=renderCertCard(rsa,'HTTPS (RSA)','HTTPS(RSA)','https_rsa');
+  if(targets.indexOf('radius')>=0) certCards+=renderCertCard(rsa,'RADIUS','RADIUS','radius');
+  if(targets.indexOf('radsec')>=0) certCards+=renderCertCard(rsa,'RadSec','RadSec','radsec');
+  document.getElementById('cert-cards').innerHTML=certCards;
   document.getElementById('cluster-cards').innerHTML=renderClusterNodes(data);
   document.getElementById('info-cards').innerHTML=renderInfoCards(data,_healthData);
   document.getElementById('log-body').innerHTML=renderLog(data.activity);
