@@ -578,10 +578,18 @@ def ensure_letsencrypt_chain_trusted(
 
 def _get_server_uuid(api: ApiPlatformCertificates) -> str:
     """
-    Return the publisher server UUID using the special 'publisher' keyword.
+    Return the UUID of the server we are currently authenticated against,
+    using the special 'this' keyword.
 
-    Uses ApiLocalServerConfiguration.get_cluster_server_by_uuid(uuid="publisher")
-    → GET /api/cluster/server/publisher
+    Uses ApiLocalServerConfiguration.get_cluster_server_by_uuid(uuid="this")
+    → GET /api/cluster/server/this
+
+    Deliberately NOT "publisher": in cluster mode this function is called once
+    per node with the API session pointed at that node's own host, and
+    "publisher" always resolves to the cluster publisher's UUID regardless of
+    which node you're connected to — using it here would silently re-apply
+    every "per-node" upload to the publisher's own server-cert slot instead of
+    the target node's.
 
     This avoids GET /api/server which returns Guest portal HTML on some CPPM
     configurations, and avoids needing a real UUID upfront.
@@ -593,15 +601,15 @@ def _get_server_uuid(api: ApiPlatformCertificates) -> str:
         verify_ssl=api.verify_ssl,
         timeout=api.timeout,
     )
-    log.info("Fetching publisher server UUID via GET /api/cluster/server/publisher...")
-    resp = local_api.get_cluster_server_by_uuid(uuid="publisher")
+    log.info("Fetching this server's UUID via GET /api/cluster/server/this...")
+    resp = local_api.get_cluster_server_by_uuid(uuid="this")
     if isinstance(resp, dict):
         uuid = resp.get("server_uuid") or resp.get("uuid") or resp.get("id")
         if uuid:
-            log.info("  Publisher UUID: %s", uuid)
+            log.info("  Server UUID: %s", uuid)
             return str(uuid)
     raise RuntimeError(
-        f"Cannot extract server_uuid from GET /api/cluster/server/publisher: {resp}"
+        f"Cannot extract server_uuid from GET /api/cluster/server/this: {resp}"
     )
 
 

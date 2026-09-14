@@ -71,27 +71,27 @@ entrypoint.sh
                                                     │     └── update_cert_trust_list_...() (flags wrong)
                                                     │
                                                     ├── Step 1: RADIUS (RSA) Service Certificate (if selected)
-                                                    │     ├── get_cluster_server_by_uuid("publisher")
+                                                    │     ├── get_cluster_server_by_uuid("this")
                                                     │     ├── get_server_cert()   (find RADIUS service_name)
                                                     │     └── PUT /api/server-cert/name/{uuid}/RADIUS
                                                     │           PKCS12 served via CPPM_CALLBACK_HOST
                                                     │
                                                     ├── Step 2: RadSec (RSA) Service Certificate (if selected)
-                                                    │     ├── get_cluster_server_by_uuid("publisher")
+                                                    │     ├── get_cluster_server_by_uuid("this")
                                                     │     ├── get_server_cert()   (find RADSEC service_name)
                                                     │     └── PUT /api/server-cert/name/{uuid}/{RADSEC service_name}
                                                     │           Reuses the RSA PKCS12 bundle
                                                     │           Skipped if no dedicated RadSec slot exists
                                                     │
                                                     ├── Step 3: HTTPS(ECC) Server Certificate (if selected)
-                                                    │     ├── get_cluster_server_by_uuid("publisher")
-                                                    │     │     GET /api/cluster/server/publisher
+                                                    │     ├── get_cluster_server_by_uuid("this")
+                                                    │     │     GET /api/cluster/server/this
                                                     │     ├── get_server_cert()   (find HTTPS(ECC) service_name)
                                                     │     └── PUT /api/server-cert/name/{uuid}/HTTPS(ECC)
                                                     │           PKCS12 served via CPPM_CALLBACK_HOST
                                                     │
                                                     ├── Step 4: HTTPS(RSA) Server Certificate (if selected)
-                                                    │     ├── get_cluster_server_by_uuid("publisher")
+                                                    │     ├── get_cluster_server_by_uuid("this")
                                                     │     ├── get_server_cert()   (find HTTPS(RSA) service_name)
                                                     │     └── PUT /api/server-cert/name/{uuid}/HTTPS(RSA)
                                                     │           Reuses the RSA PKCS12 bundle
@@ -244,12 +244,12 @@ LAN IP that CPPM can route to.
 
 | Method | Path |
 |---|---|
-| `GET` | `/api/cluster/server/publisher` |
+| `GET` | `/api/cluster/server/this` |
 | `GET` | `/api/server-cert` |
 | `PUT` | `/api/server-cert/name/{server_uuid}/HTTPS(ECC)` |
 
-The publisher server UUID is fetched via
-`ApiLocalServerConfiguration.get_cluster_server_by_uuid(uuid="publisher")`.
+The server's own UUID is fetched via
+`ApiLocalServerConfiguration.get_cluster_server_by_uuid(uuid="this")`.
 The HTTPS(ECC) service name is confirmed from `get_server_cert()` — the
 script prefers `HTTPS(ECC)` (service_id=2) then falls back to `HTTPS(RSA)`
 (service_id=7).

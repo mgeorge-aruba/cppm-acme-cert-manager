@@ -434,7 +434,7 @@ entrypoint.sh
                                                     │     cert_usage: ["EAP", "Others"]
                                                     │
                                                     ├── Step 1: ECC → HTTPS(ECC)
-                                                    │     GET  /api/cluster/server/publisher  (UUID)
+                                                    │     GET  /api/cluster/server/this  (UUID)
                                                     │     GET  /api/server-cert  (find HTTPS(ECC) slot)
                                                     │     PUT  /api/server-cert/name/{uuid}/HTTPS(ECC)
                                                     │     CPPM fetches PKCS12 via CPPM_CALLBACK_HOST
@@ -1089,7 +1089,7 @@ https://cppm.example.com/api-docs/
 | `GET` | `/api/cert-trust-list` | Fetch trust list entries |
 | `POST` | `/api/cert-trust-list` | Add LE CA cert to trust list |
 | `PATCH` | `/api/cert-trust-list/{id}` | Patch trust list flags |
-| `GET` | `/api/cluster/server/publisher` | Get publisher server UUID |
+| `GET` | `/api/cluster/server/this` | Get the connected server's own UUID |
 | `GET` | `/api/server-cert` | List server cert slots |
 | `PUT` | `/api/server-cert/name/{uuid}/HTTPS(ECC)` | Upload ECC cert |
 | `PUT` | `/api/server-cert/name/{uuid}/RADIUS` | Upload RSA cert |

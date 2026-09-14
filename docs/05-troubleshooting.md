@@ -197,9 +197,9 @@ flags manually in the CPPM Admin UI.
 
 ---
 
-## HTTPS upload fails — `GET /api/cluster/server/publisher` returns error
+## HTTPS upload fails — `GET /api/cluster/server/this` returns error
 
-**Symptom:** `upload.log` shows an error fetching the publisher UUID.
+**Symptom:** `upload.log` shows an error fetching the server's own UUID.
 
 **Cause:** The API client's Operator Profile does not include read access to
 cluster/server configuration.
