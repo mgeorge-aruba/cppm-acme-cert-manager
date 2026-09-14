@@ -1430,10 +1430,11 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .sched-label{font-size:0.68rem;color:var(--muted);margin-top:0.15rem}
 .sched-sub{font-size:0.65rem;color:var(--subtle);margin-top:0.1rem}
 .cluster-row td{padding:0 0.85rem 0.85rem;border-bottom:1px solid rgba(51,65,85,.4)}
-.cluster-nodes-inline{display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center}
-.cluster-lbl{font-size:0.62rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--subtle);flex-shrink:0}
+.cluster-nodes-inline{display:flex;flex-direction:column;align-items:flex-start;gap:0.4rem}
+.cluster-lbl{font-size:0.62rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--subtle)}
 .cluster-node-chip{display:flex;align-items:center;flex-wrap:wrap;gap:0.35rem;background:rgba(148,163,184,.06);border:1px solid rgba(148,163,184,.15);border-radius:0.4rem;padding:0.3rem 0.55rem}
 .cluster-node-name{font-family:monospace;font-size:0.72rem;color:var(--text)}
+.cluster-node-ip{font-weight:400;color:var(--subtle)}
 @media(max-width:700px){.overview-table th:nth-child(4),.overview-table td:nth-child(4){display:none}}
 
 /* ── Status dots (health indicators) ── */
@@ -2827,9 +2828,12 @@ def _cluster_overview_row(s: dict) -> str:
         chips = []
         for node in nodes:
             name = _esc(node.get("host") or "Unknown node")
+            addr = str(node.get("address") or "").strip()
+            label = (f'{name} <span class="cluster-node-ip">{_esc(addr)}</span>'
+                     if addr and addr != node.get("host") else name)
             if node.get("error"):
                 chips.append(
-                    f'<div class="cluster-node-chip"><span class="cluster-node-name">{name}</span>'
+                    f'<div class="cluster-node-chip"><span class="cluster-node-name">{label}</span>'
                     f'<span class="badge badge-danger">{_esc(node["error"])}</span></div>'
                 )
                 continue
@@ -2839,7 +2843,7 @@ def _cluster_overview_row(s: dict) -> str:
                                   for sv in services)
             else:
                 badges = '<span style="font-size:0.7rem;color:var(--subtle)">No certificate service data</span>'
-            chips.append(f'<div class="cluster-node-chip"><span class="cluster-node-name">{name}</span>{badges}</div>')
+            chips.append(f'<div class="cluster-node-chip"><span class="cluster-node-name">{label}</span>{badges}</div>')
         body = "".join(chips)
     return (f'<tr class="cluster-row"><td colspan="{_OVERVIEW_COLSPAN}">'
             f'<div class="cluster-nodes-inline"><span class="cluster-lbl">Cluster nodes</span>{body}</div>'
@@ -3267,12 +3271,14 @@ function renderClusterRow(s){
   }else{
     body=nodes.map(function(node){
       var name=esc(node.host||'Unknown node');
+      var addr=(node.address||'').trim();
+      var label=(addr&&addr!==node.host)?name+' <span class="cluster-node-ip">'+esc(addr)+'</span>':name;
       if(node.error){
-        return'<div class="cluster-node-chip"><span class="cluster-node-name">'+name+'</span><span class="badge badge-danger">'+esc(node.error)+'</span></div>';
+        return'<div class="cluster-node-chip"><span class="cluster-node-name">'+label+'</span><span class="badge badge-danger">'+esc(node.error)+'</span></div>';
       }
       var services=node.services||[];
       var badges=services.length?services.map(function(sv){return svcBadge(sv.service_name,sv.status);}).join(''):'<span style="font-size:0.7rem;color:var(--subtle)">No certificate service data</span>';
-      return'<div class="cluster-node-chip"><span class="cluster-node-name">'+name+'</span>'+badges+'</div>';
+      return'<div class="cluster-node-chip"><span class="cluster-node-name">'+label+'</span>'+badges+'</div>';
     }).join('');
   }
   return'<tr class="cluster-row"><td colspan="5"><div class="cluster-nodes-inline"><span class="cluster-lbl">Cluster nodes</span>'+body+'</div></td></tr>';
