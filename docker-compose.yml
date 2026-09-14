@@ -118,5 +118,10 @@ services:
 
 volumes:
   cppm_certs:
-    name: cppm_certs
     driver: local
+    driver_opts:
+      type: none
+      o: bind
+      # Host directory for persistent storage.
+      # Create before first run: sudo mkdir -p /opt/cppm-certs
+      device: /opt/cppm-certs

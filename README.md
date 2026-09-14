@@ -180,20 +180,45 @@ cppm-acme-cert-manager/
 ### Shared Certificates Across ClearPass Targets
 
 Each ClearPass entry has a **Certificate Profile ID** in the web UI. Give
-multiple ClearPass entries the same profile ID to share one ACME certificate.
-When adding a target with an existing Profile ID, leave the domain, SANs, ACME,
-DNS, and certificate-target fields empty or at their defaults; they are inherited
-from the existing profile. The manager issues or renews ECC/RSA once per profile,
-then uploads the resulting certificate sequentially to every associated target.
+multiple ClearPass entries the same profile ID to share one ACME certificate —
+useful when the same certificate needs to be installed on several independent
+ClearPass Policy Managers.
+
+When you open **+ Add Server** and at least one profile already exists, a
+**Certificate Profile** dropdown appears above the Certificate Profile ID field:
+
+- **+ Create new certificate profile** (default) — Domain, SAN DNS, ACME
+  Email, Certificate Authority, DNS Provider, and Certificate Types are all
+  entered manually, same as before.
+- **Selecting an existing profile** — those same fields are auto-populated
+  from the matching server entry and locked (read-only/greyed out), since
+  they're shared by every server on that profile. Only the ClearPass-specific
+  fields (Label, Host/IP, Cluster mode, Client ID/Secret, Callback Host/Port,
+  Verify SSL) need to be entered manually. To change a shared value later,
+  edit any existing server on that profile — the update applies to every
+  server sharing the profile ID the next time each is saved.
+
+The manager issues or renews ECC/RSA once per profile, then uploads the
+resulting certificate sequentially to every associated target.
 
 The ACME Provider section also accepts up to 10 optional **SAN DNS** names.
 They are included in every ECC/RSA certificate alongside the primary domain.
 
-Enable **Cluster mode** on a ClearPass target to upload the selected certificates
-to every node returned by `GET /api/cluster/server`. The configured API client,
-secret, and callback host are reused for each node. Cluster uploads run
-sequentially, and HTTPS targets remain last because ClearPass may restart web
-services after an HTTPS certificate update.
+### Cluster Mode
+
+Enable **Cluster mode** on a ClearPass target to upload the selected
+certificates to every node returned by `GET /api/cluster/server`. The
+configured API client, secret, and callback host are reused for each node;
+each node's management IP is used directly (falling back to DNS resolution of
+its hostname) so uploads and status checks work even when a node's FQDN isn't
+resolvable from the Docker host. Cluster uploads run sequentially, and HTTPS
+targets remain last because ClearPass may restart web services after an HTTPS
+certificate update.
+
+Both the Dashboard and the per-server detail page show a **Cluster Nodes**
+breakdown for any cluster-mode server — each node listed on its own line with
+its hostname, management IP, and per-service (HTTPS(ECC), HTTPS(RSA), RADIUS,
+RadSec) install status, or an error badge if a node couldn't be reached.
 
 Use **Force Certificate Issue** to renew the shared profile and upload it to all
 associated targets. Use **Force Upload** when only one target needs its existing
@@ -318,10 +343,14 @@ domain, and ACME settings — is entered here and stored in `servers.json`.
 
 | Section | Fields |
 |---|---|
-| **Identity** | Friendly label (e.g. `Production ClearPass`) |
-| **ClearPass** | Host/IP, Client ID, Client Secret, Cert Passphrase, Callback Host, Callback Port, Verify SSL |
-| **Domain & ACME** | Domain, ACME email, Certificate Authority |
+| **Identity** | Friendly label (e.g. `Production ClearPass`), and a Certificate Profile — reuse an existing profile from the dropdown or create a new one (see [Shared Certificates Across ClearPass Targets](#shared-certificates-across-clearpass-targets)) |
+| **ClearPass** | Host/IP, Cluster mode, Client ID, Client Secret, Cert Passphrase, Callback Host, Callback Port, Verify SSL |
+| **Domain & ACME** | Domain, up to 10 SAN DNS names, ACME email, Certificate Authority, Certificate Types (HTTPS(ECC)/HTTPS(RSA)/RADIUS/RadSec) |
 | **DNS Provider** | Provider selector + credentials (see table below) |
+
+> Domain, SAN DNS, ACME, DNS Provider, and Certificate Types are locked
+> (read-only) when reusing an existing Certificate Profile — see
+> [Shared Certificates Across ClearPass Targets](#shared-certificates-across-clearpass-targets).
 
 #### CLI method
 
@@ -510,11 +539,15 @@ The main page shows a table with one row per configured ClearPass server.
 
 | Column | What you see |
 |---|---|
-| **ClearPass Server** | Friendly label and host address |
+| **ClearPass Server** | Friendly label and host address, plus live status dots for ClearPass, DNS, and the PKCS12 callback |
 | **DNS & ACME Provider** | DNS provider with the ACME certificate authority listed below |
-| **ECC Certificate** | Days remaining (colour-coded), expiry date, HTTPS · Web Interface label |
-| **RSA Certificate** | Days remaining (colour-coded), expiry date, RADIUS · 802.1X label |
+| **Certificate Services** | One badge per certificate target — HTTPS(ECC), HTTPS(RSA), RadSec, RADIUS — each showing days remaining (colour-coded) and expiry date. HTTPS(RSA), RadSec, and RADIUS share the same RSA certificate |
 | **Next Renewal Check** | Countdown to the next scheduled renewal run and the cron schedule |
+
+For any server with **Cluster mode** enabled, a row directly beneath it lists
+every cluster node on its own line — hostname, management IP, and its
+certificate-service install status — so cluster health is visible from the
+dashboard without opening the server detail page.
 
 The table refreshes every 30 seconds. Click any row or **Details →** to open
 the per-server detail view.
@@ -523,11 +556,13 @@ the per-server detail view.
 
 ![Per-server detail view](docs/ui-server-detail.png)
 
-Shows the full certificate status for one server: cert cards with days
-remaining, expiry, issuer and key type; renewal schedule; Configuration card
-with service connectivity status lights for the DNS provider and ClearPass host;
-and the last 40 activity log entries. Click **View Details** on a cert card to
-inspect the full decoded certificate with a PEM copy button.
+Shows the full certificate status for one server: four cert cards —
+HTTPS(ECC), HTTPS(RSA), RADIUS, RadSec — with days remaining, expiry, issuer
+and key type; a **Cluster Nodes** card (cluster-mode servers only) listing
+every node's per-service install status; renewal schedule; a Configuration
+card with service connectivity status lights for the DNS provider and
+ClearPass host; and the last 40 activity log entries. Click **View Details**
+on a cert card to inspect the full decoded certificate with a PEM copy button.
 
 ### Servers page — ClearPass server configuration
 
