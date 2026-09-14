@@ -45,7 +45,7 @@ from auth_utils import (
 )
 from config_utils import (
     load_servers, get_server, add_server, update_server, delete_server,
-  server_cert_dir, get_server_env_dict, certificate_members,
+  server_cert_dir, get_server_env_dict, certificate_members, list_certificate_profiles,
     get_server_notifications, update_server_notifications,
     get_traefik_config, save_traefik_config, get_traefik_log,
 )
@@ -2370,10 +2370,67 @@ def _settings_form_page(server: dict = None, error: str = "",
     san_dns = s.get("san_dns") or []
     san_fields = "".join(
       f'''<div class="field"><label>SAN DNS {i}</label>
-      <input type="text" name="san_dns_{i}" value="{_esc(str(san_dns[i - 1])) if len(san_dns) >= i else ""}"
+      <input type="text" name="san_dns_{i}" class="cert-shared" value="{_esc(str(san_dns[i - 1])) if len(san_dns) >= i else ""}"
            placeholder="alt{i}.{fv('domain')}"></div>'''
       for i in range(1, 11)
     )
+    # Certificate Profile ID field — a dropdown of existing profiles (add mode
+    # only) lets a new server reuse another target's ACME/DNS configuration.
+    # The backend (_inherit_certificate_profile) already re-derives the shared
+    # fields from the matching profile on save regardless of what the form
+    # posts for them; the dropdown + auto-fill below is purely to make that
+    # behavior visible and to save re-typing.
+    cert_profiles_script = ""
+    if is_edit:
+        cert_profile_field_html = f'''
+      <div class="field">
+        <label>Certificate Profile ID <span class="hint">(reuse this value on other ClearPass targets)</span></label>
+        <input type="text" name="certificate_id" id="certificate_id_input" value="{fv('certificate_id')}"
+               placeholder="e.g. arubasecurity.com-prod" pattern="[A-Za-z0-9_.-]+">
+      </div>'''
+    else:
+        profiles = list_certificate_profiles()
+        profile_options = "".join(
+            f'<option value="{_esc(pid)}">{_esc(pid)} &mdash; {_esc(p.get("label") or p.get("domain") or p.get("cppm_host", ""))}</option>'
+            for p in profiles
+            for pid in [str(p.get("certificate_id", "")).strip()]
+        )
+        if profiles:
+            profiles_json = json.dumps({
+                str(p.get("certificate_id", "")).strip(): {
+                    "domain":           p.get("domain", ""),
+                    "san_dns":          p.get("san_dns") or [],
+                    "acme_email":       p.get("acme_email", ""),
+                    "acme_server":      p.get("acme_server", ""),
+                    "dns_provider":     p.get("dns_provider", ""),
+                    "dns_credentials":  p.get("dns_credentials") or {},
+                    "cert_types":       p.get("cert_types") or [],
+                }
+                for p in profiles
+            }).replace("</", "<\\/")
+            cert_profile_field_html = f'''
+      <div class="field">
+        <label>Certificate Profile <span class="hint">(share one certificate across multiple ClearPass targets)</span></label>
+        <select id="cert_profile_select" onchange="applyCertProfile(this.value)">
+          <option value="">+ Create new certificate profile</option>
+          {profile_options}
+        </select>
+      </div>
+      <div class="field">
+        <label>Certificate Profile ID</label>
+        <input type="text" name="certificate_id" id="certificate_id_input" value="{fv('certificate_id')}"
+               placeholder="e.g. arubasecurity.com-prod" pattern="[A-Za-z0-9_.-]+">
+        <div class="hint" id="cert-profile-notice" style="display:none;margin-top:0.35rem;color:var(--accent)"></div>
+      </div>'''
+            cert_profiles_script = f'<script>window.CERT_PROFILES = {profiles_json};</script>'
+        else:
+            cert_profile_field_html = f'''
+      <div class="field">
+        <label>Certificate Profile ID <span class="hint">(reuse this value on other ClearPass targets)</span></label>
+        <input type="text" name="certificate_id" id="certificate_id_input" value="{fv('certificate_id')}"
+               placeholder="e.g. arubasecurity.com-prod" pattern="[A-Za-z0-9_.-]+">
+      </div>'''
+
     # Form body — f-string with all interpolated Python values.
     # JavaScript is in a separate raw string appended below (no {{ }} issues).
     form = f"""
@@ -2392,11 +2449,7 @@ def _settings_form_page(server: dict = None, error: str = "",
         <input type="text" name="label" value="{fv('label')}" required
                placeholder="e.g. Production ClearPass">
       </div>
-      <div class="field">
-        <label>Certificate Profile ID <span class="hint">(reuse this value on other ClearPass targets)</span></label>
-        <input type="text" name="certificate_id" value="{fv('certificate_id')}"
-               placeholder="e.g. arubasecurity.com-prod" pattern="[A-Za-z0-9_.-]+">
-      </div>
+      {cert_profile_field_html}
     </div>
 
     <div class="card" style="margin-bottom:1rem">
@@ -2459,12 +2512,12 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="form-2col">
         <div class="field">
           <label>Domain</label>
-             <input type="text" name="domain" value="{fv('domain')}"
+             <input type="text" name="domain" id="domain" class="cert-shared" value="{fv('domain')}"
                  placeholder="cppm.example.com">
         </div>
         <div class="field">
           <label>ACME Email</label>
-             <input type="email" name="acme_email" value="{fv('acme_email')}"
+             <input type="email" name="acme_email" id="acme_email" class="cert-shared" value="{fv('acme_email')}"
                  placeholder="admin@example.com">
         </div>
       </div>
@@ -2473,7 +2526,7 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="form-2col">{san_fields}</div>
       <div class="field">
         <label>Certificate Authority</label>
-        <select name="acme_server" id="acme_server" onchange="switchAcme(this.value)">
+        <select name="acme_server" id="acme_server" class="cert-shared" onchange="switchAcme(this.value)">
           <option value="letsencrypt"{sel(acme_srv,'letsencrypt')}>Let&apos;s Encrypt</option>
           <option value="letsencrypt_test"{sel(acme_srv,'letsencrypt_test')}>Let&apos;s Encrypt (Staging)</option>
           <option value="zerossl"{sel(acme_srv,'zerossl')}>ZeroSSL</option>
@@ -2489,11 +2542,11 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>EAB KID</label>
-            <input type="text" name="EAB_KID" value="{cv('EAB_KID')}" autocomplete="off">
+            <input type="text" name="EAB_KID" id="EAB_KID" class="cert-shared" value="{cv('EAB_KID')}" autocomplete="off">
           </div>
           <div class="field">
             <label>EAB HMAC Key</label>
-            <input type="password" name="EAB_HMAC_KEY" value="{cv('EAB_HMAC_KEY')}" autocomplete="new-password">
+            <input type="password" name="EAB_HMAC_KEY" id="EAB_HMAC_KEY" class="cert-shared" value="{cv('EAB_HMAC_KEY')}" autocomplete="new-password">
           </div>
         </div>
       </div>
@@ -2506,7 +2559,7 @@ def _settings_form_page(server: dict = None, error: str = "",
         </div>
         <div class="field" style="margin-bottom:0">
           <label>ACME Directory URL</label>
-          <input type="url" name="acme_server_url" id="acme_server_url"
+          <input type="url" name="acme_server_url" id="acme_server_url" class="cert-shared"
                  value="{acme_custom_url}"
                  placeholder="https://ca.corp.local/acme/acme/directory"
                  autocomplete="off">
@@ -2515,22 +2568,22 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="field" style="margin-bottom:0">
         <label>Certificate Types</label>
         <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
-             <input type="checkbox" name="issue_https_ecc" value="true"{chk_https_ecc}
+             <input type="checkbox" name="issue_https_ecc" class="cert-shared" value="true"{chk_https_ecc}
                  style="width:auto;margin:0">
              HTTPS (ECC) <span class="hint">— Web UI and API</span>
         </label>
         <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
-             <input type="checkbox" name="issue_https_rsa" value="true"{chk_https_rsa}
+             <input type="checkbox" name="issue_https_rsa" class="cert-shared" value="true"{chk_https_rsa}
                  style="width:auto;margin:0">
              HTTPS (RSA) <span class="hint">— Web UI and API</span>
            </label>
            <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
-             <input type="checkbox" name="issue_radius" value="true"{chk_radius}
+             <input type="checkbox" name="issue_radius" class="cert-shared" value="true"{chk_radius}
                style="width:auto;margin:0">
              RADIUS <span class="hint">— 802.1X / EAP</span>
            </label>
            <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;margin-top:0.35rem">
-             <input type="checkbox" name="issue_radsec" value="true"{chk_radsec}
+             <input type="checkbox" name="issue_radsec" class="cert-shared" value="true"{chk_radsec}
                style="width:auto;margin:0">
              RadSec <span class="hint">— RADIUS over TLS</span>
         </label>
@@ -2541,7 +2594,7 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div class="form-section-title">DNS Provider</div>
       <div class="field">
         <label>Provider</label>
-        <select name="dns_provider" id="dns_provider" onchange="switchDns(this.value)">
+        <select name="dns_provider" id="dns_provider" class="cert-shared" onchange="switchDns(this.value)">
           <option value="cloudflare"{sel(s.get('dns_provider','cloudflare'),'cloudflare')}>Cloudflare</option>
           <option value="porkbun"{sel(s.get('dns_provider',''),'porkbun')}>Porkbun</option>
           <option value="route53"{sel(s.get('dns_provider',''),'route53')}>AWS Route 53</option>
@@ -2556,30 +2609,30 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>API Token <span class="hint">(Zone DNS, scoped — recommended)</span></label>
-            <input type="password" name="CF_Token" value="{cv('CF_Token')}"
+            <input type="password" name="CF_Token" class="cert-shared" value="{cv('CF_Token')}"
                    autocomplete="new-password">
           </div>
           <div class="field">
             <label>Zone ID</label>
-            <input type="text" name="CF_Zone_ID" value="{cv('CF_Zone_ID')}"
+            <input type="text" name="CF_Zone_ID" class="cert-shared" value="{cv('CF_Zone_ID')}"
                    autocomplete="off">
           </div>
         </div>
         <div class="form-2col">
           <div class="field">
             <label>Account ID <span class="hint">(optional with token)</span></label>
-            <input type="text" name="CF_Account_ID" value="{cv('CF_Account_ID')}"
+            <input type="text" name="CF_Account_ID" class="cert-shared" value="{cv('CF_Account_ID')}"
                    autocomplete="off">
           </div>
           <div class="field" style="opacity:0.65">
             <label>Global API Key <span class="hint">(alternative to token)</span></label>
-            <input type="password" name="CF_Key" value="{cv('CF_Key')}"
+            <input type="password" name="CF_Key" class="cert-shared" value="{cv('CF_Key')}"
                    autocomplete="new-password">
           </div>
         </div>
         <div class="field" style="opacity:0.65;margin-bottom:0">
           <label>Account Email <span class="hint">(required with global key only)</span></label>
-          <input type="email" name="CF_Email" value="{cv('CF_Email')}"
+          <input type="email" name="CF_Email" class="cert-shared" value="{cv('CF_Email')}"
                  autocomplete="off">
         </div>
       </div>
@@ -2588,12 +2641,12 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>API Key</label>
-            <input type="password" name="PORKBUN_API_KEY" value="{cv('PORKBUN_API_KEY')}"
+            <input type="password" name="PORKBUN_API_KEY" class="cert-shared" value="{cv('PORKBUN_API_KEY')}"
                    autocomplete="new-password">
           </div>
           <div class="field">
             <label>Secret API Key</label>
-            <input type="password" name="PORKBUN_SECRET_API_KEY"
+            <input type="password" name="PORKBUN_SECRET_API_KEY" class="cert-shared"
                    value="{cv('PORKBUN_SECRET_API_KEY')}" autocomplete="new-password">
           </div>
         </div>
@@ -2603,18 +2656,18 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>Access Key ID</label>
-            <input type="text" name="AWS_ACCESS_KEY_ID" value="{cv('AWS_ACCESS_KEY_ID')}"
+            <input type="text" name="AWS_ACCESS_KEY_ID" class="cert-shared" value="{cv('AWS_ACCESS_KEY_ID')}"
                    autocomplete="off">
           </div>
           <div class="field">
             <label>Secret Access Key</label>
-            <input type="password" name="AWS_SECRET_ACCESS_KEY"
+            <input type="password" name="AWS_SECRET_ACCESS_KEY" class="cert-shared"
                    value="{cv('AWS_SECRET_ACCESS_KEY')}" autocomplete="new-password">
           </div>
         </div>
         <div class="field" style="margin-bottom:0">
           <label>Region</label>
-          <input type="text" name="AWS_DEFAULT_REGION"
+          <input type="text" name="AWS_DEFAULT_REGION" class="cert-shared"
                  value="{cv('AWS_DEFAULT_REGION', 'us-east-1')}" autocomplete="off">
         </div>
       </div>
@@ -2622,7 +2675,7 @@ def _settings_form_page(server: dict = None, error: str = "",
       <div id="dns-digitalocean" class="dns-section"{vis('digitalocean')}>
         <div class="field" style="margin-bottom:0">
           <label>API Token</label>
-          <input type="password" name="DO_API_KEY" value="{cv('DO_API_KEY')}"
+          <input type="password" name="DO_API_KEY" class="cert-shared" value="{cv('DO_API_KEY')}"
                  autocomplete="new-password">
         </div>
       </div>
@@ -2631,11 +2684,11 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>API Key</label>
-            <input type="text" name="GD_Key" value="{cv('GD_Key')}" autocomplete="off">
+            <input type="text" name="GD_Key" class="cert-shared" value="{cv('GD_Key')}" autocomplete="off">
           </div>
           <div class="field">
             <label>API Secret</label>
-            <input type="password" name="GD_Secret" value="{cv('GD_Secret')}"
+            <input type="password" name="GD_Secret" class="cert-shared" value="{cv('GD_Secret')}"
                    autocomplete="new-password">
           </div>
         </div>
@@ -2645,36 +2698,36 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>Grid Master Host <span class="hint">(hostname or IP)</span></label>
-            <input type="text" name="INFOBLOX_HOST" value="{cv('INFOBLOX_HOST')}"
+            <input type="text" name="INFOBLOX_HOST" class="cert-shared" value="{cv('INFOBLOX_HOST')}"
                    autocomplete="off">
           </div>
           <div class="field">
             <label>Username</label>
-            <input type="text" name="INFOBLOX_USERNAME" value="{cv('INFOBLOX_USERNAME')}"
+            <input type="text" name="INFOBLOX_USERNAME" class="cert-shared" value="{cv('INFOBLOX_USERNAME')}"
                    autocomplete="off">
           </div>
         </div>
         <div class="form-2col">
           <div class="field">
             <label>Password</label>
-            <input type="password" name="INFOBLOX_PASSWORD" value="{cv('INFOBLOX_PASSWORD')}"
+            <input type="password" name="INFOBLOX_PASSWORD" class="cert-shared" value="{cv('INFOBLOX_PASSWORD')}"
                    autocomplete="new-password">
           </div>
           <div class="field">
             <label>DNS View <span class="hint">(default: default)</span></label>
-            <input type="text" name="INFOBLOX_VIEW" value="{cv('INFOBLOX_VIEW', 'default')}"
+            <input type="text" name="INFOBLOX_VIEW" class="cert-shared" value="{cv('INFOBLOX_VIEW', 'default')}"
                    autocomplete="off">
           </div>
         </div>
         <div class="form-2col" style="margin-bottom:0">
           <div class="field">
             <label>WAPI Version <span class="hint">(default: 2.5)</span></label>
-            <input type="text" name="INFOBLOX_WAPI_VERSION"
+            <input type="text" name="INFOBLOX_WAPI_VERSION" class="cert-shared"
                    value="{cv('INFOBLOX_WAPI_VERSION', '2.5')}" autocomplete="off">
           </div>
           <div class="field">
             <label>SSL Verify <span class="hint">(true/false)</span></label>
-            <input type="text" name="INFOBLOX_SSL_VERIFY"
+            <input type="text" name="INFOBLOX_SSL_VERIFY" class="cert-shared"
                    value="{cv('INFOBLOX_SSL_VERIFY', 'true')}" autocomplete="off">
           </div>
         </div>
@@ -2684,30 +2737,30 @@ def _settings_form_page(server: dict = None, error: str = "",
         <div class="form-2col">
           <div class="field">
             <label>Nameserver <span class="hint">(host or host:port)</span></label>
-            <input type="text" name="RFC2136_NAMESERVER" value="{cv('RFC2136_NAMESERVER')}"
+            <input type="text" name="RFC2136_NAMESERVER" class="cert-shared" value="{cv('RFC2136_NAMESERVER')}"
                    autocomplete="off">
           </div>
           <div class="field">
             <label>TSIG Key Name <span class="hint">(leave blank for unsigned updates)</span></label>
-            <input type="text" name="RFC2136_TSIG_KEY" value="{cv('RFC2136_TSIG_KEY')}"
+            <input type="text" name="RFC2136_TSIG_KEY" class="cert-shared" value="{cv('RFC2136_TSIG_KEY')}"
                    autocomplete="off">
           </div>
         </div>
         <div class="form-2col">
           <div class="field">
             <label>TSIG Secret</label>
-            <input type="password" name="RFC2136_TSIG_SECRET"
+            <input type="password" name="RFC2136_TSIG_SECRET" class="cert-shared"
                    value="{cv('RFC2136_TSIG_SECRET')}" autocomplete="new-password">
           </div>
           <div class="field">
             <label>TSIG Algorithm <span class="hint">(default: hmac-md5)</span></label>
-            <input type="text" name="RFC2136_TSIG_ALGORITHM"
+            <input type="text" name="RFC2136_TSIG_ALGORITHM" class="cert-shared"
                    value="{cv('RFC2136_TSIG_ALGORITHM', 'hmac-md5')}" autocomplete="off">
           </div>
         </div>
         <div class="field" style="margin-bottom:0">
           <label>DNS Timeout <span class="hint">(seconds, default: 10)</span></label>
-          <input type="text" name="RFC2136_DNS_TIMEOUT"
+          <input type="text" name="RFC2136_DNS_TIMEOUT" class="cert-shared"
                  value="{cv('RFC2136_DNS_TIMEOUT', '10')}" autocomplete="off">
         </div>
       </div>
@@ -2741,13 +2794,82 @@ function switchAcme(val) {
   urlInput.required = isCustom;
   eabSec.style.display = val === 'zerossl' ? '' : 'none';
 }
+function setSharedFieldsDisabled(disabled) {
+  document.querySelectorAll('.cert-shared').forEach(function(el) { el.disabled = disabled; });
+}
+function applyCertProfile(value) {
+  var idInput = document.getElementById('certificate_id_input');
+  var notice  = document.getElementById('cert-profile-notice');
+  if (!value) {
+    idInput.readOnly = false;
+    idInput.value = '';
+    ['domain', 'acme_email', 'EAB_KID', 'EAB_HMAC_KEY'].forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    for (var i = 1; i <= 10; i++) {
+      var san = document.querySelector('[name="san_dns_' + i + '"]');
+      if (san) san.value = '';
+    }
+    document.querySelectorAll('.dns-section input').forEach(function(el) { el.value = ''; });
+    document.getElementById('acme_server_url').value = '';
+    ['issue_https_ecc', 'issue_https_rsa', 'issue_radius', 'issue_radsec'].forEach(function(name) {
+      var el = document.querySelector('[name="' + name + '"]');
+      if (el) el.checked = true;
+    });
+    setSharedFieldsDisabled(false);
+    switchDns(document.getElementById('dns_provider').value);
+    switchAcme(document.getElementById('acme_server').value);
+    if (notice) notice.style.display = 'none';
+    return;
+  }
+  var p = (window.CERT_PROFILES || {})[value];
+  if (!p) return;
+  idInput.value = value;
+  idInput.readOnly = true;
+  document.getElementById('domain').value = p.domain || '';
+  document.getElementById('acme_email').value = p.acme_email || '';
+  for (var j = 1; j <= 10; j++) {
+    var sanEl = document.querySelector('[name="san_dns_' + j + '"]');
+    if (sanEl) sanEl.value = (p.san_dns && p.san_dns[j - 1]) || '';
+  }
+  var rawAcme = p.acme_server || 'letsencrypt';
+  var acmeSel = rawAcme.indexOf('http') === 0 ? 'custom' : rawAcme;
+  document.getElementById('acme_server').value = acmeSel;
+  document.getElementById('acme_server_url').value = acmeSel === 'custom' ? rawAcme : '';
+  var creds = p.dns_credentials || {};
+  document.getElementById('EAB_KID').value = creds.EAB_KID || '';
+  document.getElementById('EAB_HMAC_KEY').value = creds.EAB_HMAC_KEY || '';
+  var dnsProv = p.dns_provider || 'cloudflare';
+  document.getElementById('dns_provider').value = dnsProv;
+  document.querySelectorAll('.dns-section input').forEach(function(el) { el.value = ''; });
+  Object.keys(creds).forEach(function(k) {
+    if (k === 'EAB_KID' || k === 'EAB_HMAC_KEY') return;
+    var el = document.querySelector('.dns-section [name="' + k + '"]');
+    if (el) el.value = creds[k];
+  });
+  var types = (p.cert_types || []).slice();
+  if (types.indexOf('ecc') !== -1) types.push('https_ecc');
+  if (types.indexOf('rsa') !== -1) { types.push('radius'); types.push('radsec'); }
+  ['https_ecc', 'https_rsa', 'radius', 'radsec'].forEach(function(t) {
+    var el = document.querySelector('[name="issue_' + t + '"]');
+    if (el) el.checked = types.indexOf(t) !== -1;
+  });
+  switchDns(dnsProv);
+  switchAcme(acmeSel);
+  setSharedFieldsDisabled(true);
+  if (notice) {
+    notice.style.display = '';
+    notice.textContent = 'Populated from certificate profile "' + value + '". These fields are shared by every server on this profile — edit a server already on the profile to change them.';
+  }
+}
 (function() {
   switchDns(document.getElementById('dns_provider').value);
   switchAcme(document.getElementById('acme_server').value);
 })();
 </script>"""
 
-    return _base(title, form + script,
+    return _base(title, form + cert_profiles_script + script,
                  nav_user=username, active="settings", show_nav=True)
 
 

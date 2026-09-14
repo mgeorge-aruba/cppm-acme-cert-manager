@@ -275,6 +275,21 @@ def certificate_members(profile_id: str) -> list[dict]:
     return [s for s in load_servers() if certificate_id(s) == profile_id]
 
 
+def list_certificate_profiles() -> list[dict]:
+    """Return one representative server entry per distinct *explicit* certificate
+    profile ID (the value typed into the Certificate Profile ID field — this is
+    what _inherit_certificate_profile matches on, not the host-based fallback)."""
+    profiles: list[dict] = []
+    seen: set[str] = set()
+    for server in load_servers():
+        profile_id = str(server.get("certificate_id", "")).strip()
+        if not profile_id or profile_id in seen:
+            continue
+        seen.add(profile_id)
+        profiles.append(server)
+    return profiles
+
+
 def certificate_owner_ids() -> list[str]:
     """Return one target ID per certificate profile for ACME work."""
     owners: list[str] = []
