@@ -45,9 +45,10 @@ from auth_utils import (
 )
 from config_utils import (
     load_servers, get_server, add_server, update_server, delete_server,
-  server_cert_dir, get_server_env_dict, certificate_members, list_certificate_profiles,
+    server_cert_dir, get_server_env_dict, certificate_members, list_certificate_profiles,
     get_server_notifications, update_server_notifications,
     get_traefik_config, save_traefik_config, get_traefik_log,
+    certificate_targets,
 )
 
 # ── Version ───────────────────────────────────────────────────────────────────
@@ -252,7 +253,7 @@ def build_server_status(server: dict) -> dict:
             "ecc": parse_cert(cert_dir / f"{domain}.ecc.cer"),
             "rsa": parse_cert(cert_dir / f"{domain}.rsa.cer"),
         },
-        "targets": server.get("cert_types") or ["https_ecc", "https_rsa", "radius", "radsec"],
+        "targets": certificate_targets(server) or ["https_ecc", "https_rsa", "radius", "radsec"],
         "cluster_mode": bool(server.get("cppm_cluster_mode", False)),
         "cluster_nodes": [],
         "schedule":    next_check_info(),
@@ -1424,15 +1425,15 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .server-row:hover td{background:rgba(255,255,255,.022)}
 .srv-label{font-weight:600;font-size:0.85rem;margin-bottom:0.18rem}
 .srv-host{font-family:monospace;font-size:0.75rem;color:var(--muted);display:flex;align-items:center;gap:0.3rem}
-.mini-cert{border-left:3px solid var(--subtle);padding:0.28rem 0.55rem;border-radius:0 0.3rem 0.3rem 0;display:inline-block;min-width:88px}
+.mini-cert{border-left:3px solid var(--subtle);padding:0.22rem 0.4rem;border-radius:0 0.3rem 0.3rem 0;display:inline-block;min-width:70px}
 .mini-cert.ok{border-left-color:var(--ok)}.mini-cert.warn{border-left-color:var(--warn)}.mini-cert.danger{border-left-color:var(--danger)}.mini-cert.none{border-left-color:var(--subtle)}
-.mini-days{font-size:1.5rem;font-weight:800;line-height:1;letter-spacing:-.02em}
+.mini-days{font-size:1.2rem;font-weight:800;line-height:1;letter-spacing:-.02em}
 .mini-days.ok{color:var(--ok)}.mini-days.warn{color:var(--warn)}.mini-days.danger{color:var(--danger)}.mini-days.none{color:var(--subtle)}
-.mini-label{font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:0.1rem}
-.mini-exp{font-size:0.68rem;color:var(--subtle);margin-top:0.12rem}
-.mini-svc{font-size:0.62rem;color:var(--muted);background:rgba(148,163,184,.08);border-radius:3px;padding:0.05rem 0.35rem;margin-top:0.25rem;display:inline-block;border:1px solid rgba(148,163,184,.15)}
-.cert-badges{display:flex;flex-wrap:wrap;gap:0.4rem}
-.cert-badges .mini-cert{min-width:76px}
+.mini-label{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:0.1rem}
+.mini-exp{font-size:0.62rem;color:var(--subtle);margin-top:0.1rem}
+.mini-svc{font-size:0.6rem;color:var(--muted);background:rgba(148,163,184,.08);border-radius:3px;padding:0.05rem 0.3rem;margin-top:0.2rem;display:inline-block;border:1px solid rgba(148,163,184,.15)}
+.cert-badges{display:flex;flex-wrap:wrap;gap:0.3rem}
+.cert-badges .mini-cert{min-width:70px}
 .sched-next{font-size:1.05rem;font-weight:700;color:var(--accent);line-height:1}
 .sched-label{font-size:0.68rem;color:var(--muted);margin-top:0.15rem}
 .sched-sub{font-size:0.65rem;color:var(--subtle);margin-top:0.1rem}
@@ -2991,8 +2992,9 @@ def _overview_rows(servers: list) -> str:
         dns  = _esc(_DNS_DISPLAY.get(s.get("dns_provider", ""), s.get("dns_provider", "")))
         _acme_raw = s.get("acme_server", "")
         acme = _esc(_ACME_DISPLAY.get(_acme_raw, "Custom CA" if _acme_raw.startswith("http") else _acme_raw))
-        ecc  = s.get("certs", {}).get("ecc", {"exists": False})
-        rsa  = s.get("certs", {}).get("rsa", {"exists": False})
+        ecc      = s.get("certs", {}).get("ecc", {"exists": False})
+        rsa      = s.get("certs", {}).get("rsa", {"exists": False})
+        tgts     = s.get("targets") or ["https_ecc", "https_rsa", "radius", "radsec"]
         raw_sid = str(s.get("id", ""))
         def _dot(kind: str) -> str:
             return (f'<span id="ov-{_esc(raw_sid)}-{kind}" class="sdot checking"'
@@ -3005,10 +3007,10 @@ def _overview_rows(servers: list) -> str:
                 f'{_dot("cb")}<span style="font-size:0.68rem;color:var(--subtle)">Callback</span>'
                 f'</div>')
         cert_badges = (
-            f'{_mini_cert(ecc, "HTTPS(ECC)")}'
-            f'{_mini_cert(rsa, "HTTPS(RSA)")}'
-            f'{_mini_cert(rsa, "RadSec")}'
-            f'{_mini_cert(rsa, "RADIUS")}'
+            (f'{_mini_cert(ecc, "HTTPS(ECC)")}' if "https_ecc" in tgts else "")
+            + (f'{_mini_cert(rsa, "HTTPS(RSA)")}' if "https_rsa" in tgts else "")
+            + (f'{_mini_cert(rsa, "RadSec")}' if "radsec" in tgts else "")
+            + (f'{_mini_cert(rsa, "RADIUS")}' if "radius" in tgts else "")
         )
         rows.append(
             f'<tr class="server-row" onclick="window.location.href=\'/server/{sid}\'">'
@@ -3434,7 +3436,12 @@ function renderRow(s){
   var sid=s.id||'';
   var ecc=(s.certs&&s.certs.ecc)||{exists:false};
   var rsa=(s.certs&&s.certs.rsa)||{exists:false};
-  var certBadges=renderMiniCert(ecc,'HTTPS(ECC)')+renderMiniCert(rsa,'HTTPS(RSA)')+renderMiniCert(rsa,'RadSec')+renderMiniCert(rsa,'RADIUS');
+  var tgts=s.targets||['https_ecc','https_rsa','radius','radsec'];
+  var certBadges=''
+    +(tgts.indexOf('https_ecc')>=0?renderMiniCert(ecc,'HTTPS(ECC)'):'')
+    +(tgts.indexOf('https_rsa')>=0?renderMiniCert(rsa,'HTTPS(RSA)'):'')
+    +(tgts.indexOf('radsec')>=0?renderMiniCert(rsa,'RadSec'):'')
+    +(tgts.indexOf('radius')>=0?renderMiniCert(rsa,'RADIUS'):'');
   return'<tr class="server-row" data-sid="'+esc(sid)+'" onclick="nav(this)">'
     +'<td><div class="srv-label">'+esc(s.label||s.cppm_host)+'</div>'
     +'<div class="srv-host">'+esc(s.cppm_host)+'</div>'
