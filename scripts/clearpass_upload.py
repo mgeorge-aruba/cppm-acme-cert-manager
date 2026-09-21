@@ -228,6 +228,30 @@ def load_bundled_acme_certs() -> dict[str, CertInfo]:
 # PKCS12 conversion
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _log_chain_contents(fullchain_path: str) -> None:
+    """
+    Log subject/issuer/fingerprint for every cert actually embedded in the
+    fullchain file about to be converted to PKCS12.
+
+    This is the file CPPM's PKCS12 gets built from — it is a *different*
+    file from the .ca.cer that Step 0 validates. If a renewal ever leaves
+    it stale (e.g. from before an ACME CA's root migration), the chain CPPM
+    receives can silently diverge from the one Step 0 just verified as
+    trusted, producing 422s that reference certs Step 0 never saw.
+    """
+    try:
+        text = Path(fullchain_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("  Could not read %s for chain diagnostic: %s", fullchain_path, exc)
+        return
+    certs = parse_pem_bundle(text, label_prefix=Path(fullchain_path).name)
+    log.info("  Chain in %s (%d cert(s)):", fullchain_path, len(certs))
+    for i, c in enumerate(certs):
+        log.info("    [%d] subject=%s", i, c.subject)
+        log.info("        issuer=%s", c.issuer)
+        log.info("        sha256=%s  notAfter=%s", c.fingerprint, c.not_after)
+
+
 def pem_to_pkcs12(cert_path: str, key_path: str, fullchain_path: str,
                   passphrase: str, out_path: str) -> None:
     """
@@ -235,6 +259,7 @@ def pem_to_pkcs12(cert_path: str, key_path: str, fullchain_path: str,
     No -certpbe/-keypbe/-macalg flags: OpenSSL 3.x defaults to PBES2/AES-256-CBC
     with SHA-256 MAC, which Java 11+ (ClearPass 6.9+) accepts.
     """
+    _log_chain_contents(fullchain_path)
     log.info("Converting PEM -> PKCS12: %s", out_path)
     try:
         result = subprocess.run(
@@ -332,6 +357,13 @@ def _autoheal_trust_list_usage(api: ApiPlatformCertificates, cn: str, usage: str
     previous cert used) which Step 0 never saw and therefore never patched.
     When CPPM's upload rejection names one of these by CN, look it up
     directly here and fix it instead of failing the whole run.
+
+    IMPORTANT: a CN is not unique. Public CAs commonly publish two certs
+    with the identical Subject (e.g. "USERTrust RSA Certification
+    Authority" exists both self-signed and cross-signed by the legacy
+    "AAA Certificate Services" root) — same CN, different fingerprint,
+    different usage. So every entry matching the CN is checked, not just
+    the first one found.
     """
     try:
         raw = api.get_cert_trust_list(limit="1000")
@@ -341,6 +373,7 @@ def _autoheal_trust_list_usage(api: ApiPlatformCertificates, cn: str, usage: str
         log.error("  Autoheal: cannot fetch trust list: %s", exc)
         return False
 
+    matches: list[dict] = []
     for entry in trust_list:
         pem = entry.get("cert_file", "")
         if not pem or "BEGIN CERTIFICATE" not in pem:
@@ -355,22 +388,32 @@ def _autoheal_trust_list_usage(api: ApiPlatformCertificates, cn: str, usage: str
         if "CN=" not in subj:
             continue
         entry_cn = subj.split("CN=")[-1].split(",")[0].strip()
-        if entry_cn.lower() != cn.lower():
-            continue
+        if entry_cn.lower() == cn.lower():
+            matches.append(entry)
 
+    if not matches:
+        log.warning("  Autoheal: no trust list entry found matching CN=%r", cn)
+        return False
+
+    if len(matches) > 1:
+        log.warning(
+            "  Autoheal: %d trust list entries share CN=%r (id=%s) — "
+            "likely distinct certs (e.g. self-signed vs. cross-signed variant) "
+            "with the same Subject.",
+            len(matches), cn, [e.get("id") for e in matches],
+        )
+
+    already_ok: list[Any] = []
+    for entry in matches:
         entry_id = entry.get("id")
-        if entry_id is None:
-            log.warning("  Autoheal: matched CN=%r but entry has no id.", cn)
-            return False
-
         usage_raw = entry.get("cert_usage", [])
         usage_strs = [str(u) for u in usage_raw] if isinstance(usage_raw, list) else []
         if usage in usage_strs:
-            log.warning(
-                "  Autoheal: CN=%r (id=%s) already has usage %r — "
-                "upload is failing for another reason.", cn, entry_id, usage,
-            )
-            return False
+            already_ok.append(entry_id)
+            continue
+        if entry_id is None:
+            log.warning("  Autoheal: matched CN=%r but entry has no id.", cn)
+            continue
         new_usage = usage_strs + [usage]
         log.warning(
             "  Autoheal: CN=%r (id=%s) is missing usage %r — patching to %s "
@@ -387,9 +430,17 @@ def _autoheal_trust_list_usage(api: ApiPlatformCertificates, cn: str, usage: str
             return True
         except Exception as exc:
             log.error("  Autoheal: patch failed for id=%s: %s", entry_id, exc)
-            return False
 
-    log.warning("  Autoheal: no trust list entry found matching CN=%r", cn)
+    if already_ok:
+        log.warning(
+            "  Autoheal: every trust list entry matching CN=%r (id=%s) already "
+            "has usage %r — CPPM is rejecting the upload for a reason autoheal "
+            "can't fix by usage-patching alone (e.g. a missing parent CA, or the "
+            "uploaded chain referencing a different cert with this same CN than "
+            "any entry already in the trust list). Check the chain diagnostic "
+            "logged just before this upload for what was actually sent.",
+            cn, already_ok, usage,
+        )
     return False
 
 
