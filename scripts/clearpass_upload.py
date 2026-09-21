@@ -317,26 +317,37 @@ _TRUST_USAGE_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+_TRUST_MISSING_ERROR_RE = re.compile(
+    r'Certificate\s+CA\s+"([^"]+)"\s+with\s+appropriate\s+Subject\s+Key\s+Identifier'
+    r'\s+must\s+be\s+added\s+and\s+enabled',
+    re.IGNORECASE,
+)
+
+
+def _detail_to_text(detail: Any) -> str:
+    """
+    Pull the human-readable message out of a CPPM error body.
+
+    For a dict, this reads validation_messages/detail directly rather than
+    json.dumps-ing the whole thing — that would backslash-escape the quotes
+    around the embedded DN and break the regexes that parse it.
+    """
+    if isinstance(detail, str):
+        text = detail
+    elif isinstance(detail, dict):
+        text = str(detail.get("validation_messages") or detail.get("detail") or detail)
+    else:
+        text = str(detail)
+    # CPPM HTML-escapes '=' inside the DN (e.g. "CN&#x3d;USERTrust ...").
+    return html.unescape(text)
+
 
 def _parse_trust_usage_error(detail: Any) -> Optional[tuple[str, str]]:
     """
     Detect CPPM's "Certificate ... in Trust List must have usage as ..." 422
     and pull out the offending cert's CN and the missing usage string.
-
-    CPPM HTML-escapes '=' inside the DN (e.g. "CN&#x3d;USERTrust ..."), so the
-    message needs unescaping before the DN can be parsed.
     """
-    if isinstance(detail, str):
-        text = detail
-    elif isinstance(detail, dict):
-        # Pull the human-readable message directly rather than json.dumps-ing
-        # the whole dict — that would backslash-escape the embedded quotes
-        # around the DN and break the regex below.
-        text = str(detail.get("validation_messages") or detail.get("detail") or detail)
-    else:
-        text = str(detail)
-    text = html.unescape(text)
-    m = _TRUST_USAGE_ERROR_RE.search(text)
+    m = _TRUST_USAGE_ERROR_RE.search(_detail_to_text(detail))
     if not m:
         return None
     dn, usage = m.group(1), m.group(2)
@@ -344,6 +355,20 @@ def _parse_trust_usage_error(detail: Any) -> Optional[tuple[str, str]]:
         return None
     cn = dn.split("CN=")[-1].split(",")[0].strip()
     return cn, usage
+
+
+def _parse_trust_missing_error(detail: Any) -> Optional[str]:
+    """
+    Detect CPPM's "Certificate CA ... must be added and enabled ..." 422 and
+    pull out the missing parent CA's CN.
+    """
+    m = _TRUST_MISSING_ERROR_RE.search(_detail_to_text(detail))
+    if not m:
+        return None
+    dn = m.group(1)
+    if "CN=" not in dn:
+        return None
+    return dn.split("CN=")[-1].split(",")[0].strip()
 
 
 def _autoheal_trust_list_usage(api: ApiPlatformCertificates, cn: str, usage: str) -> bool:
@@ -445,6 +470,209 @@ def _autoheal_trust_list_usage(api: ApiPlatformCertificates, cn: str, usage: str
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Chain completion — walk up to the certs CPPM actually needs, not just the
+# ones acme.sh happened to bundle in ca.cer
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ACME CAs commonly hand back a *valid but incomplete-for-CPPM* chain: the
+# leaf's issuing intermediate may itself be a cross-signed variant (same
+# Subject as another cert CPPM already trusts, but signed by a different,
+# older root for backward compatibility) rather than the self-signed root
+# CPPM's validator expects to terminate on. acme.sh's ca.cer only contains
+# what the ACME CA actually served, so Step 0 needs to keep walking upward
+# from there to find the rest.
+
+def _try_openssl(args: list[str], input_data: bytes) -> Optional[str]:
+    """Like _run_openssl but returns None instead of raising on failure."""
+    try:
+        result = subprocess.run(
+            ["openssl"] + args, input=input_data,
+            capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _extract_ca_issuer_url(pem: str) -> Optional[str]:
+    """Pull the AIA 'CA Issuers' URI (parent cert download link) from a cert."""
+    text = _try_openssl(["x509", "-noout", "-text"],
+                         (pem.strip() + "\n").encode())
+    if not text:
+        return None
+    m = re.search(r"CA Issuers\s*-\s*URI:(\S+)", text)
+    return m.group(1) if m else None
+
+
+def _bytes_to_pem_certs(data: bytes) -> list[str]:
+    """
+    Normalise a fetched CA-repository response to a list of PEM cert blocks.
+    Handles plain PEM, DER-encoded single X.509 certs, and PKCS#7 (.p7c)
+    bundles — Sectigo/Comodo publish several cross-signed variants of the
+    same CA bundled together in one .p7c, so all of them must be extracted,
+    not just the first.
+    """
+    try:
+        text = data.decode("utf-8")
+        if "-----BEGIN CERTIFICATE-----" in text:
+            return re.findall(
+                r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                text, re.DOTALL,
+            )
+    except UnicodeDecodeError:
+        pass
+    pkcs7_pem = _try_openssl(["pkcs7", "-inform", "DER", "-print_certs"], data)
+    if pkcs7_pem and "BEGIN CERTIFICATE" in pkcs7_pem:
+        return re.findall(
+            r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            pkcs7_pem, re.DOTALL,
+        )
+    x509_pem = _try_openssl(["x509", "-inform", "DER"], data)
+    if x509_pem and "BEGIN CERTIFICATE" in x509_pem:
+        return [x509_pem.strip()]
+    return []
+
+
+def _fetch_certs_from_url(url: str) -> list[CertInfo]:
+    import requests as _req
+    try:
+        resp = _req.get(url, timeout=10)
+    except Exception as exc:
+        log.debug("    Fetch %s failed: %s", url, exc)
+        return []
+    if not resp.ok:
+        log.debug("    Fetch %s -> HTTP %d", url, resp.status_code)
+        return []
+    pem_blocks = _bytes_to_pem_certs(resp.content)
+    if not pem_blocks:
+        return []
+    joined = "\n".join(b.strip() for b in pem_blocks)
+    return parse_pem_bundle(joined, label_prefix=url.rsplit("/", 1)[-1])
+
+
+_CHAIN_FETCH_HOSTS = ("crt.sectigo.com", "crt.usertrust.com", "crt.comodoca.com")
+
+
+def _guess_well_known_ca_urls(cn: str) -> list[str]:
+    """
+    Last-resort fallback for a parent CA that can't be found via AIA — some
+    older Sectigo/Comodo/USERTrust cross-signed root variants only publish
+    an OCSP URI in their AIA extension, not a CA Issuers link, since they
+    predate that convention. Their own official repositories still serve
+    every cert by a predictable "CN with spaces stripped" filename, so try
+    that instead of giving up.
+    """
+    name = re.sub(r"[^A-Za-z0-9]", "", cn)
+    urls = []
+    for host in _CHAIN_FETCH_HOSTS:
+        urls.append(f"http://{host}/{name}.crt")
+        urls.append(f"http://{host}/{name}.p7c")
+    return urls
+
+
+def _cn_of(dn: str) -> str:
+    return dn.split("CN=")[-1].split(",")[0].strip() if "CN=" in dn else dn.strip()
+
+
+def _complete_chain(required: dict[str, CertInfo], max_depth: int = 6) -> None:
+    """
+    Walk up from every cert already in `required` to its issuing CA,
+    adding any missing links so the chain reaches a self-signed root —
+    mutates `required` in place.
+
+    Matching is by fingerprint/issuer, not by CN: some CAs (Sectigo in
+    particular) publish the *same* Subject under several different
+    certificates — self-signed, and cross-signed by one or more legacy
+    roots for backward compatibility. Having any cert with a given CN in
+    `required` does not mean the specific parent this chain needs is
+    present, so each cert's actual issuer is checked explicitly.
+    """
+    seen_fps = set(required.keys())
+    frontier = list(required.values())
+    depth = 0
+    while frontier and depth < max_depth:
+        depth += 1
+        next_frontier: list[CertInfo] = []
+        for cert in frontier:
+            if _cn_of(cert.subject) == _cn_of(cert.issuer):
+                continue  # self-signed root — chain ends here
+            issuer_cn = _cn_of(cert.issuer)
+            if any(_cn_of(c.subject) == issuer_cn for c in required.values()):
+                continue  # this cert's specific parent is already present
+
+            log.info("  Chain incomplete: %s issued by %r — resolving parent...",
+                     cert.label, issuer_cn)
+            candidates = _fetch_certs_from_url(_extract_ca_issuer_url(cert.pem) or "")
+            if not candidates:
+                for url in _guess_well_known_ca_urls(issuer_cn):
+                    candidates = _fetch_certs_from_url(url)
+                    if candidates:
+                        break
+            if not candidates:
+                log.warning(
+                    "  Could not resolve parent %r for %s — CPPM may reject "
+                    "uploads referencing it until it's added to the trust "
+                    "list manually.", issuer_cn, cert.label,
+                )
+                continue
+
+            for c in candidates:
+                fp = _normalise_fp(c.fingerprint)
+                if fp in seen_fps:
+                    continue
+                seen_fps.add(fp)
+                cn, issuer = _cn_of(c.subject), _cn_of(c.issuer)
+                c.label = (f"Chain: {cn} [self-signed]" if cn == issuer
+                           else f"Chain: {cn} (issued by {issuer})")
+                required[fp] = c
+                next_frontier.append(c)
+                log.info("    + Discovered: %s", c.label)
+        frontier = next_frontier
+
+
+def _autoheal_missing_ca(api: ApiPlatformCertificates, cn: str) -> bool:
+    """
+    Reactive counterpart to _complete_chain(), triggered when CPPM rejects an
+    upload with "Certificate CA ... must be added and enabled" for a CN that
+    Step 0's proactive chain-walk didn't find (e.g. it ran before this parent
+    was needed, or its own fetch attempt failed transiently). Fetches it from
+    the well-known Sectigo/Comodo/USERTrust repositories and adds it with the
+    full usage set Step 0 grants every ACME CA cert.
+    """
+    candidates = []
+    for url in _guess_well_known_ca_urls(cn):
+        candidates = _fetch_certs_from_url(url)
+        if candidates:
+            break
+    if not candidates:
+        log.error("  Autoheal: could not fetch missing CA %r from any known repository.", cn)
+        return False
+
+    added_any = False
+    for cert in candidates:
+        log.warning(
+            "  Autoheal: adding missing parent CA %r (found: %s, sha256=%s)...",
+            cn, cert.subject, cert.fingerprint,
+        )
+        try:
+            resp = api.new_cert_trust_list(body={
+                "cert_file":  cert.pem.strip() + "\n",
+                "enabled":    True,
+                "cert_usage": ["EAP", "Others", "RadSec"],
+            })
+            _check_response(resp, f"autoheal add missing CA {cn}")
+            log.info("  Autoheal: added id=%s", resp.get("id", "?") if isinstance(resp, dict) else "?")
+            added_any = True
+        except Exception as exc:
+            log.warning("  Autoheal: add failed for %s (sha256=%s): %s — "
+                        "may already be present under a different usage state.",
+                        cert.subject, cert.fingerprint, exc)
+    return added_any
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 0 – Trust List Pre-flight
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -515,6 +743,12 @@ def ensure_letsencrypt_chain_trusted(
     if not required:
         log.error("No ACME CA certs available – rebuild the image.")
         return summary
+
+    # Some ACME CAs hand back a chain that's valid but incomplete for CPPM's
+    # own validator — e.g. the intermediate is a cross-signed variant whose
+    # parent isn't the self-signed root already in `required`. Walk AIA (and
+    # a well-known-repository fallback) to fill in whatever's missing.
+    _complete_chain(required)
 
     log.info("Total unique ACME CA certs to verify: %d", len(required))
 
@@ -918,39 +1152,55 @@ def _serve_pkcs12_and_upload(
             except Exception:
                 detail = resp.text[:400]
 
-            # CPPM's server-side chain validation can reject the upload over a
-            # trust list entry that Step 0 never touched (e.g. an orphaned
-            # cert left over from a prior CA/root migration). If we can
-            # identify and patch it, retry the same PUT once before failing.
-            if resp.status_code == 422 and api is not None:
-                parsed = _parse_trust_usage_error(detail)
-                if parsed is not None:
-                    cn, usage = parsed
+            # CPPM's server-side chain validation can reject the upload over
+            # a trust list entry Step 0 never touched — e.g. an orphaned cert
+            # from a prior CA/root migration, or a parent CA further up the
+            # chain than Step 0's own walk resolved. If we can identify and
+            # fix it, retry the same PUT — each fix can surface the *next*
+            # missing link, so this loops a bounded number of times rather
+            # than retrying just once.
+            last_status, last_detail = resp.status_code, detail
+            for _attempt in range(3):
+                if last_status != 422 or api is None:
+                    break
+                healed = False
+                usage_parsed = _parse_trust_usage_error(last_detail)
+                if usage_parsed is not None:
+                    cn, usage = usage_parsed
                     log.warning(
                         "  CPPM rejected upload over trust list usage for CN=%r "
                         "(needs %r) — attempting autoheal...", cn, usage,
                     )
-                    if _autoheal_trust_list_usage(api, cn, usage):
-                        retry = _req.put(url, headers=headers, json=body,
-                                          verify=verify_ssl, timeout=60)
-                        log.debug("  Retry PUT %s → HTTP %d  body=%s",
-                                  url.split("/api/")[1], retry.status_code,
-                                  retry.text[:300])
-                        if retry.status_code in (200, 201, 204):
-                            log.info("  Upload succeeded after autoheal retry.")
-                            return
-                        try:
-                            detail = retry.json()
-                        except Exception:
-                            detail = retry.text[:400]
-                        raise RuntimeError(
-                            f"CPPM rejected cert upload (HTTP {retry.status_code}) "
-                            f"for {service_name} even after autoheal retry: {detail}"
+                    healed = _autoheal_trust_list_usage(api, cn, usage)
+                else:
+                    missing_cn = _parse_trust_missing_error(last_detail)
+                    if missing_cn is not None:
+                        log.warning(
+                            "  CPPM rejected upload — parent CA %r missing from "
+                            "trust list — attempting autoheal...", missing_cn,
                         )
+                        healed = _autoheal_missing_ca(api, missing_cn)
+
+                if not healed:
+                    break
+
+                retry = _req.put(url, headers=headers, json=body,
+                                  verify=verify_ssl, timeout=60)
+                log.debug("  Retry PUT %s → HTTP %d  body=%s",
+                          url.split("/api/")[1], retry.status_code,
+                          retry.text[:300])
+                if retry.status_code in (200, 201, 204):
+                    log.info("  Upload succeeded after autoheal retry.")
+                    return
+                try:
+                    last_detail = retry.json()
+                except Exception:
+                    last_detail = retry.text[:400]
+                last_status = retry.status_code
 
             raise RuntimeError(
-                f"CPPM rejected cert upload (HTTP {resp.status_code}) "
-                f"for {service_name}: {detail}"
+                f"CPPM rejected cert upload (HTTP {last_status}) "
+                f"for {service_name}: {last_detail}"
             )
         if _state["rejected_ip"] is not None:
             log.warning(
