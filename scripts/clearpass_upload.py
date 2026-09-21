@@ -36,6 +36,7 @@ import argparse
 import base64
 import dataclasses
 import datetime
+import html
 import json
 import logging
 import os
@@ -284,6 +285,112 @@ def _check_response(data: Any, operation: str) -> None:
             )
     elif isinstance(data, str) and ("Error" in data or "error" in data):
         raise RuntimeError(f"CPPM API returned error string during '{operation}': {data}")
+
+
+_TRUST_USAGE_ERROR_RE = re.compile(
+    r'Certificate\s+"([^"]+)"\s+in\s+Trust\s+List\s+must\s+have\s+usage\s+as\s+"([^"]+)"',
+    re.IGNORECASE,
+)
+
+
+def _parse_trust_usage_error(detail: Any) -> Optional[tuple[str, str]]:
+    """
+    Detect CPPM's "Certificate ... in Trust List must have usage as ..." 422
+    and pull out the offending cert's CN and the missing usage string.
+
+    CPPM HTML-escapes '=' inside the DN (e.g. "CN&#x3d;USERTrust ..."), so the
+    message needs unescaping before the DN can be parsed.
+    """
+    if isinstance(detail, str):
+        text = detail
+    elif isinstance(detail, dict):
+        # Pull the human-readable message directly rather than json.dumps-ing
+        # the whole dict — that would backslash-escape the embedded quotes
+        # around the DN and break the regex below.
+        text = str(detail.get("validation_messages") or detail.get("detail") or detail)
+    else:
+        text = str(detail)
+    text = html.unescape(text)
+    m = _TRUST_USAGE_ERROR_RE.search(text)
+    if not m:
+        return None
+    dn, usage = m.group(1), m.group(2)
+    if "CN=" not in dn:
+        return None
+    cn = dn.split("CN=")[-1].split(",")[0].strip()
+    return cn, usage
+
+
+def _autoheal_trust_list_usage(api: ApiPlatformCertificates, cn: str, usage: str) -> bool:
+    """
+    Patch the usage flags on an existing trust list entry identified by CN.
+
+    Step 0 only fixes usage on certs it discovers from the current ACME chain
+    files (bundled image certs + this run's .ca.cer). CPPM's own server-side
+    chain validation can also pull in an older trust list entry left over
+    from a prior CA/root migration (e.g. a legacy cross-signed root that a
+    previous cert used) which Step 0 never saw and therefore never patched.
+    When CPPM's upload rejection names one of these by CN, look it up
+    directly here and fix it instead of failing the whole run.
+    """
+    try:
+        raw = api.get_cert_trust_list(limit="1000")
+        _check_response(raw, "get_cert_trust_list (autoheal)")
+        trust_list = _items_from_response(raw)
+    except Exception as exc:
+        log.error("  Autoheal: cannot fetch trust list: %s", exc)
+        return False
+
+    for entry in trust_list:
+        pem = entry.get("cert_file", "")
+        if not pem or "BEGIN CERTIFICATE" not in pem:
+            continue
+        try:
+            subj = _run_openssl(
+                ["x509", "-noout", "-subject", "-nameopt", "compat"],
+                input_data=pem.encode(),
+            ).strip().removeprefix("subject=").strip()
+        except Exception:
+            continue
+        if "CN=" not in subj:
+            continue
+        entry_cn = subj.split("CN=")[-1].split(",")[0].strip()
+        if entry_cn.lower() != cn.lower():
+            continue
+
+        entry_id = entry.get("id")
+        if entry_id is None:
+            log.warning("  Autoheal: matched CN=%r but entry has no id.", cn)
+            return False
+
+        usage_raw = entry.get("cert_usage", [])
+        usage_strs = [str(u) for u in usage_raw] if isinstance(usage_raw, list) else []
+        if usage in usage_strs:
+            log.warning(
+                "  Autoheal: CN=%r (id=%s) already has usage %r — "
+                "upload is failing for another reason.", cn, entry_id, usage,
+            )
+            return False
+        new_usage = usage_strs + [usage]
+        log.warning(
+            "  Autoheal: CN=%r (id=%s) is missing usage %r — patching to %s "
+            "(orphaned trust list entry not covered by Step 0)...",
+            cn, entry_id, usage, new_usage,
+        )
+        try:
+            resp = api.update_cert_trust_list_by_cert_trust_list_id(
+                cert_trust_list_id=str(entry_id),
+                body={"enabled": True, "cert_usage": new_usage},
+            )
+            _check_response(resp, f"autoheal patch trust entry {entry_id}")
+            log.info("  Autoheal: patched id=%s -> cert_usage=%s", entry_id, new_usage)
+            return True
+        except Exception as exc:
+            log.error("  Autoheal: patch failed for id=%s: %s", entry_id, exc)
+            return False
+
+    log.warning("  Autoheal: no trust list entry found matching CN=%r", cn)
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -644,6 +751,7 @@ def _serve_pkcs12_and_upload(
     passphrase: str,
     callback_host: str,
     callback_port: int,
+    api: Optional[ApiPlatformCertificates] = None,
 ) -> None:
     """
     Serve the PKCS12 file on a fixed port and send CPPM its URL via JSON PUT.
@@ -758,6 +866,37 @@ def _serve_pkcs12_and_upload(
                 detail = resp.json()
             except Exception:
                 detail = resp.text[:400]
+
+            # CPPM's server-side chain validation can reject the upload over a
+            # trust list entry that Step 0 never touched (e.g. an orphaned
+            # cert left over from a prior CA/root migration). If we can
+            # identify and patch it, retry the same PUT once before failing.
+            if resp.status_code == 422 and api is not None:
+                parsed = _parse_trust_usage_error(detail)
+                if parsed is not None:
+                    cn, usage = parsed
+                    log.warning(
+                        "  CPPM rejected upload over trust list usage for CN=%r "
+                        "(needs %r) — attempting autoheal...", cn, usage,
+                    )
+                    if _autoheal_trust_list_usage(api, cn, usage):
+                        retry = _req.put(url, headers=headers, json=body,
+                                          verify=verify_ssl, timeout=60)
+                        log.debug("  Retry PUT %s → HTTP %d  body=%s",
+                                  url.split("/api/")[1], retry.status_code,
+                                  retry.text[:300])
+                        if retry.status_code in (200, 201, 204):
+                            log.info("  Upload succeeded after autoheal retry.")
+                            return
+                        try:
+                            detail = retry.json()
+                        except Exception:
+                            detail = retry.text[:400]
+                        raise RuntimeError(
+                            f"CPPM rejected cert upload (HTTP {retry.status_code}) "
+                            f"for {service_name} even after autoheal retry: {detail}"
+                        )
+
             raise RuntimeError(
                 f"CPPM rejected cert upload (HTTP {resp.status_code}) "
                 f"for {service_name}: {detail}"
@@ -838,6 +977,7 @@ def upload_https_certificate(
             token, host, api.verify_ssl,
             server_uuid, service_name, pfx_path, passphrase,
             callback_host, callback_port,
+            api=api,
         )
         log.info("  HTTPS certificate uploaded successfully.")
         return {}
@@ -897,6 +1037,7 @@ def upload_radius_certificate(
             token, host, api.verify_ssl,
             server_uuid, service_name, pfx_path, passphrase,
             callback_host, callback_port,
+            api=api,
         )
         log.info("  RADIUS certificate uploaded successfully.")
         return {}
@@ -955,6 +1096,7 @@ def upload_radsec_certificate(
             token, host, api.verify_ssl,
             server_uuid, service_name, pfx_path, passphrase,
             callback_host, callback_port,
+            api=api,
         )
         log.info("  RadSec certificate uploaded successfully.")
         return {}
