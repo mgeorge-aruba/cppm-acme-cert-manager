@@ -666,9 +666,21 @@ def _autoheal_missing_ca(api: ApiPlatformCertificates, cn: str) -> bool:
             log.info("  Autoheal: added id=%s", resp.get("id", "?") if isinstance(resp, dict) else "?")
             added_any = True
         except Exception as exc:
-            log.warning("  Autoheal: add failed for %s (sha256=%s): %s — "
-                        "may already be present under a different usage state.",
-                        cert.subject, cert.fingerprint, exc)
+            if "SHA1" in str(exc).upper() or "SHA-1" in str(exc).upper():
+                log.error(
+                    "  Autoheal: CPPM refuses %s — it is SHA-1 signed (a fixed, "
+                    "legacy root; no SHA-256 version of this exact cert exists). "
+                    "CPPM's own upload validator is asking for a certificate its "
+                    "Trust List import validator categorically rejects — this "
+                    "combination cannot be satisfied from our side. This is a "
+                    "known CPPM limitation for certs chaining through this CA; "
+                    "see the trust-list SHA-1 bug report for details.",
+                    cert.subject,
+                )
+            else:
+                log.warning("  Autoheal: add failed for %s (sha256=%s): %s — "
+                            "may already be present under a different usage state.",
+                            cert.subject, cert.fingerprint, exc)
     return added_any
 
 
